@@ -57,6 +57,7 @@ require (
 	github.com/pkg/xattr v0.4.12
 	github.com/shirou/gopsutil/v4 v4.26.4
 	github.com/sirupsen/logrus v1.9.4
+	github.com/smol-machines/smolvm-sdk/smolvm-go v0.0.0-00010101000000-000000000000
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.11.1
@@ -187,3 +188,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	moul.io/http2curl/v2 v2.3.0 // indirect
 )
+
+replace github.com/smol-machines/smolvm-sdk/smolvm-go => ../smolvm-sdk/smolvm-go

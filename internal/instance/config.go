@@ -1285,6 +1285,73 @@ var InstanceConfigKeysVM = map[string]func(value string) error{
 	"volatile.vm.hotplug.memory": validate.Optional(validate.IsAny),
 }
 
+// InstanceConfigKeysSmolVM is a map of config key to validator. (keys applying to smolvm-backed instances only).
+var InstanceConfigKeysSmolVM = map[string]func(value string) error{
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.server)
+	// URL of the smolvm server used to manage this instance.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm server URL
+	"smolvm.server": validate.Optional(validate.IsAny),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.image)
+	// OCI image reference launched inside the smolvm machine.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: OCI image reference
+	"smolvm.image": validate.Optional(validate.IsAny),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.allowed_cidrs)
+	// Comma-separated list of CIDR ranges the smolvm instance is allowed to reach.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: Egress CIDR allowlist
+	"smolvm.allowed_cidrs": validate.Optional(validate.IsAny),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.data_base)
+	// Base directory the smolvm server uses for per-machine state. The driver
+	// bind-mounts the Incus storage volume into the per-machine subdirectory
+	// (sha256(name)[:16]) under `<data_base>/smolvm/vms/`. Must match the
+	// cache directory the running smolvm server resolves at startup. When
+	// empty, the driver falls back to the OS default
+	// (`$XDG_CACHE_HOME` or `~/.cache` on Linux).
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm server cache base directory
+	"smolvm.data_base": validate.Optional(validate.IsAbsFilePath),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.binary_path)
+	// Absolute path to the smolvm binary. Operator escape hatch for
+	// custom/development builds; defaults to `smolvm` resolved on PATH.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm binary path override
+	"smolvm.binary_path": validate.Optional(validate.IsAbsFilePath),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.agent_rootfs)
+	// Absolute path the smolvm server should use as the agent VM rootfs.
+	// Operator escape hatch; defaults to the per-instance rootfs under the
+	// Incus storage volume (populated from a per-pool image volume at
+	// create time). Setting this bypasses materialization — the path is
+	// used verbatim, AppArmor permitting.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm agent rootfs path override
+	"smolvm.agent_rootfs": validate.Optional(validate.IsAbsFilePath),
+}
+
 // ConfigKeyChecker returns a function that will check whether or not
 // a provide value is valid for the associate config key.  Returns an
 // error if the key is not known.  The checker function only performs
@@ -1306,6 +1373,13 @@ func ConfigKeyChecker(key string, instanceType api.InstanceType) (func(value str
 
 	if instanceType == api.InstanceTypeAny || instanceType == api.InstanceTypeVM {
 		f, ok := InstanceConfigKeysVM[key]
+		if ok {
+			return f, nil
+		}
+	}
+
+	if instanceType == api.InstanceTypeAny || instanceType == api.InstanceTypeSmolVM {
+		f, ok := InstanceConfigKeysSmolVM[key]
 		if ok {
 			return f, nil
 		}

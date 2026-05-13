@@ -5,6 +5,8 @@ incus-*.tar.xz
 .vagrant
 *~
 tags
+.claude/
+incusd-bin
 
 # Potential binaries
 cmd/fuidshift/fuidshift

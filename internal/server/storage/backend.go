@@ -695,7 +695,10 @@ func (b *backend) CreateInstance(inst instance.Instance, op *operations.Operatio
 	}
 
 	var filler *drivers.VolumeFiller
-	if inst.Type() == instancetype.Container {
+	var srcImgVol *drivers.Volume
+
+	switch inst.Type() {
+	case instancetype.Container:
 		filler = &drivers.VolumeFiller{
 			Fill: func(vol drivers.Volume, rootBlockPath string, allowUnsafeResize bool, targetIsZero bool, targetFormat string) (int64, error) {
 				// Create an empty rootfs.
@@ -707,9 +710,38 @@ func (b *backend) CreateInstance(inst instance.Instance, op *operations.Operatio
 				return 0, nil
 			},
 		}
+
+	case instancetype.SmolVM:
+		// smolvm instances boot a per-instance copy of the agent rootfs. We
+		// mirror the container image flow: build (or reuse) a cached image
+		// volume on this pool, then either CoW-clone it on optimized drivers
+		// or rsync it directly on dir. The fingerprint identifies the
+		// upstream agent-rootfs version so a smolvm upgrade publishes a new
+		// image while existing instances stay pinned to their clone.
+		src := smolvmAgentRootfsSource(inst)
+
+		fingerprint, err := b.ensureSmolvmBaseImage(src, op)
+		if err != nil {
+			return err
+		}
+
+		if b.driver.Info().OptimizedImages {
+			imgVol := b.GetVolume(drivers.VolumeTypeImage, drivers.ContentTypeFS, smolvmBaseImagePrefix+fingerprint, nil)
+			srcImgVol = &imgVol
+		} else {
+			filler = &drivers.VolumeFiller{
+				Fingerprint: fingerprint,
+				Fill:        smolvmAgentRootfsFiller(src),
+			}
+		}
 	}
 
-	err = b.driver.CreateVolume(vol, filler, op)
+	if srcImgVol != nil {
+		err = b.driver.CreateVolumeFromCopy(vol, *srcImgVol, false, false, op)
+	} else {
+		err = b.driver.CreateVolume(vol, filler, op)
+	}
+
 	if err != nil {
 		return err
 	}

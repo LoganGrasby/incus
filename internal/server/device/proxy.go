@@ -63,7 +63,7 @@ func (d *proxy) CanHotPlug() bool {
 
 // validateConfig checks the supplied config for correctness.
 func (d *proxy) validateConfig(instConf instance.ConfigReader, partialValidation bool) error {
-	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM) {
+	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM, instancetype.SmolVM) {
 		return ErrUnsupportedDevType
 	}
 
@@ -175,6 +175,31 @@ func (d *proxy) validateConfig(instConf instance.ConfigReader, partialValidation
 	err := d.config.Validate(rules)
 	if err != nil {
 		return err
+	}
+
+	// smolvm doesn't use Incus's forkproxy / NAT machinery. The smolvm
+	// driver translates proxy devices into a smolvm-server PortSpec at
+	// CreateMachineRequest time (see driver_smolvm.go applyNetworkConfig)
+	// and only port numbers cross over. Validate that listen/connect are
+	// well-formed TCP addresses and return early — the rest of this
+	// function (NAT mode, listen-address conflicts, AppArmor, firewall)
+	// does not apply.
+	if instConf.Type() == instancetype.SmolVM {
+		listenAddr, err := network.ProxyParseAddr(d.config["listen"])
+		if err != nil {
+			return err
+		}
+
+		connectAddr, err := network.ProxyParseAddr(d.config["connect"])
+		if err != nil {
+			return err
+		}
+
+		if listenAddr.ConnType != "tcp" || connectAddr.ConnType != "tcp" {
+			return errors.New("Only TCP proxy is supported on smol-vm instances")
+		}
+
+		return nil
 	}
 
 	if instConf.Type() == instancetype.VM && util.IsFalseOrEmpty(d.config["nat"]) {

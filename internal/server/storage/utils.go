@@ -134,6 +134,11 @@ func InstanceTypeToVolumeType(instType instancetype.Type) (drivers.VolumeType, e
 		return drivers.VolumeTypeContainer, nil
 	case instancetype.VM:
 		return drivers.VolumeTypeVM, nil
+	case instancetype.SmolVM:
+		// smolvm instances reuse the VM volume type. The smolvm backend manages
+		// its own internal disk images, so the Incus-side volume is just
+		// metadata storage for backup/config.
+		return drivers.VolumeTypeVM, nil
 	}
 
 	return "", errors.New("Invalid instance type")

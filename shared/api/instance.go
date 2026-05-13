@@ -27,6 +27,9 @@ const InstanceTypeContainer = InstanceType("container")
 // InstanceTypeVM defines the instance type value for a virtual-machine.
 const InstanceTypeVM = InstanceType("virtual-machine")
 
+// InstanceTypeSmolVM defines the instance type value for a smolvm-backed instance.
+const InstanceTypeSmolVM = InstanceType("smol-vm")
+
 // InstancesPost represents the fields available for a new instance.
 //
 // swagger:model

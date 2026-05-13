@@ -66,7 +66,7 @@ func (d *nicBridged) CanMigrate() bool {
 
 // validateConfig checks the supplied config for correctness.
 func (d *nicBridged) validateConfig(instConf instance.ConfigReader, partialValidation bool) error {
-	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM) {
+	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM, instancetype.SmolVM) {
 		return ErrUnsupportedDevType
 	}
 

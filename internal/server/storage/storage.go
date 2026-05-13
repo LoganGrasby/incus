@@ -29,6 +29,14 @@ func InstancePath(instanceType instancetype.Type, projectName, instanceName stri
 		return internalUtil.VarPath("virtual-machines", fullName)
 	}
 
+	if instanceType == instancetype.SmolVM {
+		if isSnapshot {
+			return internalUtil.VarPath("smol-machines-snapshots", fullName)
+		}
+
+		return internalUtil.VarPath("smol-machines", fullName)
+	}
+
 	if isSnapshot {
 		return internalUtil.VarPath("containers-snapshots", fullName)
 	}

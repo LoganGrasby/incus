@@ -195,6 +195,14 @@ func instanceProfile(sysOS *sys.OS, inst instance, extraBinaries []string) (stri
 		if err != nil {
 			return "", err
 		}
+	} else if inst.Type() == instancetype.SmolVM {
+		err = smolvmProfileTpl.Execute(sb, map[string]any{
+			"name": InstanceProfileName(inst),
+			"raw":  rawContent,
+		})
+		if err != nil {
+			return "", err
+		}
 	} else {
 		// AppArmor requires deref of all paths.
 		path, err := filepath.EvalSymlinks(inst.Path())

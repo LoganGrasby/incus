@@ -245,7 +245,7 @@ func (d *disk) sourceIsLocalPath(source string) bool {
 
 // validateConfig checks the supplied config for correctness.
 func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation bool) error {
-	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM) {
+	if !instanceSupported(instConf.Type(), instancetype.Container, instancetype.VM, instancetype.SmolVM) {
 		return ErrUnsupportedDevType
 	}
 

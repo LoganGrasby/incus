@@ -18,6 +18,9 @@ const (
 
 	// VM represents a virtual-machine instance type.
 	VM = Type(1)
+
+	// SmolVM represents a smolvm-backed instance type.
+	SmolVM = Type(2)
 )
 
 // New validates the supplied string against the allowed types of instance and returns the internal
@@ -34,6 +37,11 @@ func New(name string) (Type, error) {
 		return VM, nil
 	}
 
+	// If "smol-vm" is supplied, return type as SmolVM.
+	if api.InstanceType(name) == api.InstanceTypeSmolVM {
+		return SmolVM, nil
+	}
+
 	return -1, errors.New("Invalid instance type")
 }
 
@@ -48,6 +56,10 @@ func (instanceType Type) String() string {
 		return string(api.InstanceTypeVM)
 	}
 
+	if instanceType == SmolVM {
+		return string(api.InstanceTypeSmolVM)
+	}
+
 	return ""
 }
 
@@ -59,6 +71,10 @@ func (instanceType Type) ToAPI() api.InstanceType {
 
 	if instanceType == VM {
 		return api.InstanceTypeVM
+	}
+
+	if instanceType == SmolVM {
+		return api.InstanceTypeSmolVM
 	}
 
 	if instanceType == Any {

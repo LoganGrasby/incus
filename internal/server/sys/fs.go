@@ -37,10 +37,12 @@ func (s *OS) initDirs() error {
 		// Instances are 0711 so the runtime can traverse to the data.
 		{filepath.Join(s.VarDir, "containers"), 0o711},
 		{filepath.Join(s.VarDir, "virtual-machines"), 0o711},
+		{filepath.Join(s.VarDir, "smol-machines"), 0o711},
 
 		// Snapshots are kept 0700 as the runtime doesn't need access.
 		{filepath.Join(s.VarDir, "containers-snapshots"), 0o700},
 		{filepath.Join(s.VarDir, "virtual-machines-snapshots"), 0o700},
+		{filepath.Join(s.VarDir, "smol-machines-snapshots"), 0o700},
 
 		{filepath.Join(s.VarDir, "backups"), 0o700},
 		{s.CacheDir, 0o700},

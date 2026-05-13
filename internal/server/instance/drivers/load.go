@@ -25,8 +25,9 @@ import (
 
 // Instance driver definitions.
 var instanceDrivers = map[string]func() instance.Instance{
-	"lxc":  func() instance.Instance { return &lxc{} },
-	"qemu": func() instance.Instance { return &qemu{} },
+	"lxc":    func() instance.Instance { return &lxc{} },
+	"qemu":   func() instance.Instance { return &qemu{} },
+	"smolvm": func() instance.Instance { return &smolvm{} },
 }
 
 // DriverStatus definition.
@@ -69,6 +70,8 @@ func load(s *state.State, args db.InstanceArgs, p api.Project) (instance.Instanc
 		inst, err = lxcLoad(s, args, p)
 	case instancetype.VM:
 		inst, err = qemuLoad(s, args, p)
+	case instancetype.SmolVM:
+		inst, err = smolvmLoad(s, args, p)
 	default:
 		return nil, fmt.Errorf("Invalid instance type for instance %s", args.Name)
 	}
@@ -153,6 +156,8 @@ func create(s *state.State, args db.InstanceArgs, p api.Project, partialDeviceVa
 		return lxcCreate(s, args, p, partialDeviceValidation, op)
 	case instancetype.VM:
 		return qemuCreate(s, args, p, partialDeviceValidation, op)
+	case instancetype.SmolVM:
+		return smolvmCreate(s, args, p, partialDeviceValidation, op)
 	}
 
 	return nil, nil, errors.New("Instance type invalid")
