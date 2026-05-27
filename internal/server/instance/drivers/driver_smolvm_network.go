@@ -720,8 +720,11 @@ func (d *smolvm) smolvmConfigureNetnsIPViaDHCP(nicName string, netnsNIC string) 
 		// udhcpc is stateless, no isolation needed.
 		{"udhcpc", []string{"-q", "-f", "-n", "-i", netnsNIC}, ""},
 		// dhcpcd v10 has no runtime --pidfile/--dbdir flag, so tmpfs-shadow
-		// its state dirs.
-		{"dhcpcd", []string{"-1", "-q", netnsNIC}, "mkdir -p /run/dhcpcd /var/lib/dhcpcd && mount -t tmpfs none /run/dhcpcd && mount -t tmpfs none /var/lib/dhcpcd"},
+		// its state dirs. --noarp skips RFC 5227 ARP probing/announcing
+		// (IPv4 address-conflict detection): it adds ~4.5s to every boot and
+		// is wasted here, since Incus's dnsmasq is authoritative over the
+		// address pool so there's no uncoordinated allocator to collide with.
+		{"dhcpcd", []string{"-1", "-q", "--noarp", netnsNIC}, "mkdir -p /run/dhcpcd /var/lib/dhcpcd && mount -t tmpfs none /run/dhcpcd && mount -t tmpfs none /var/lib/dhcpcd"},
 		// dhclient supports -pf/-lf so it doesn't need a tmpfs shadow; give
 		// each invocation a unique pidfile/leasefile under /tmp instead.
 		{"dhclient", nil, ""},
