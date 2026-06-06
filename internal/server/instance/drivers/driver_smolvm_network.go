@@ -1081,6 +1081,21 @@ func (d *smolvm) smolvmServerStart(ctx context.Context) error {
 
 	args = append(args, binaryPath, "serve", "start", "--listen", "unix://"+sockPath)
 
+	// Optional passthrough of smolvm's VM-boot hardening modes. smolvm
+	// >=1.0.0 confines each boot subprocess with seccomp + Landlock and
+	// defaults both to `enforce`; its `enforce` seccomp allowlist is
+	// currently missing getpeername/mkdirat, which SIGSYS-kills image-machine
+	// boots, so operators can downgrade to `audit` here. Empty = omit the
+	// flag (smolvm's own default; also keeps pre-1.0 binaries, which don't
+	// know these flags, working).
+	if mode := d.expandedConfig["smolvm.seccomp"]; mode != "" {
+		args = append(args, "--seccomp", mode)
+	}
+
+	if mode := d.expandedConfig["smolvm.landlock"]; mode != "" {
+		args = append(args, "--landlock", mode)
+	}
+
 	cmd := exec.Command("ip", args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

@@ -1350,6 +1350,32 @@ var InstanceConfigKeysSmolVM = map[string]func(value string) error{
 	//  condition: smol-vm
 	//  shortdesc: smolvm agent rootfs path override
 	"smolvm.agent_rootfs": validate.Optional(validate.IsAbsFilePath),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.seccomp)
+	// Seccomp syscall-allowlist mode for smolvm's VM-boot subprocesses
+	// (`enforce`, `audit`, or `off`). Passed through to `smolvm serve start
+	// --seccomp`. When empty the flag is omitted and smolvm uses its own
+	// default. Only honored by smolvm builds that support the flag
+	// (>=1.0.0); x86_64-Linux only.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm VM-boot seccomp mode
+	"smolvm.seccomp": validate.Optional(validate.IsOneOf("enforce", "audit", "off")),
+
+	// gendoc:generate(entity=instance, group=smolvm, key=smolvm.landlock)
+	// Landlock filesystem-confinement mode for smolvm's VM-boot subprocesses
+	// (`enforce` or `off`). Passed through to `smolvm serve start
+	// --landlock`. When empty the flag is omitted and smolvm uses its own
+	// default. Only honored by smolvm builds that support the flag
+	// (>=1.0.0); Linux only.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: smol-vm
+	//  shortdesc: smolvm VM-boot Landlock mode
+	"smolvm.landlock": validate.Optional(validate.IsOneOf("enforce", "off")),
 }
 
 // ConfigKeyChecker returns a function that will check whether or not
