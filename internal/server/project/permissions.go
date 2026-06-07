@@ -72,6 +72,29 @@ func AllowImageDownload(tx *db.ClusterTx, projectName string, uri string) error 
 	return nil
 }
 
+// projectInstanceType maps an instance type to the type used for project limit
+// and restriction accounting. smol-vm instances are accounted as
+// virtual-machines: they share the limits.virtual-machines count limit and the
+// restricted.virtual-machines.* restrictions.
+func projectInstanceType(t instancetype.Type) instancetype.Type {
+	if t == instancetype.SmolVM {
+		return instancetype.VM
+	}
+
+	return t
+}
+
+// projectInstanceTypeFromString parses a stored instance type string and maps it
+// through projectInstanceType. Unparseable types return instancetype.Any.
+func projectInstanceTypeFromString(s string) instancetype.Type {
+	t, err := instancetype.New(s)
+	if err != nil {
+		return instancetype.Any
+	}
+
+	return projectInstanceType(t)
+}
+
 // AllowInstanceCreation returns an error if any project-specific limit or
 // restriction is violated when creating a new instance.
 func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.InstancesPost) error {
@@ -90,6 +113,8 @@ func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.Instanc
 		instanceType = instancetype.Container
 	case api.InstanceTypeVM:
 		instanceType = instancetype.VM
+	case api.InstanceTypeSmolVM:
+		instanceType = instancetype.SmolVM
 	default:
 		return fmt.Errorf("Unexpected instance type %q", req.Type)
 	}
@@ -201,8 +226,11 @@ func checkInstanceCountLimit(info *projectInfo, instanceType instancetype.Type) 
 }
 
 func getInstanceCountLimit(info *projectInfo, instanceType instancetype.Type) (int, int, error) {
+	// smol-vm instances are accounted as virtual-machines (shared count limit).
+	countType := projectInstanceType(instanceType)
+
 	var key string
-	switch instanceType {
+	switch countType {
 	case instancetype.Container:
 		key = "limits.containers"
 	case instancetype.VM:
@@ -213,7 +241,7 @@ func getInstanceCountLimit(info *projectInfo, instanceType instancetype.Type) (i
 
 	instanceCount := 0
 	for _, inst := range info.Instances {
-		if inst.Type == instanceType.String() {
+		if projectInstanceTypeFromString(inst.Type) == countType {
 			instanceCount++
 		}
 	}
@@ -241,7 +269,7 @@ func checkRestrictionsOnVolatileConfig(project api.Project, instanceType instanc
 	switch instanceType {
 	case instancetype.Container:
 		restrictedLowLevel = "restricted.containers.lowlevel"
-	case instancetype.VM:
+	case instancetype.VM, instancetype.SmolVM:
 		restrictedLowLevel = "restricted.virtual-machines.lowlevel"
 	}
 
@@ -809,7 +837,7 @@ func checkRestrictions(project api.Project, instances []api.Instance, profiles [
 		}
 
 		isContainerOrProfile := instType == instancetype.Container || instType == instancetype.Any
-		isVMOrProfile := instType == instancetype.VM || instType == instancetype.Any
+		isVMOrProfile := instType == instancetype.VM || instType == instancetype.SmolVM || instType == instancetype.Any
 
 		for key, value := range config {
 			if ((isContainerOrProfile && !allowContainerLowLevel) || (isVMOrProfile && !allowVMLowLevel)) && key == "raw.idmap" {
@@ -1254,9 +1282,12 @@ func validateInstanceCountLimit(instances []api.Instance, key, value, project st
 		return err
 	}
 
+	// smol-vm instances are accounted as virtual-machines (shared count limit).
+	countType := projectInstanceType(dbType)
+
 	count := 0
 	for _, inst := range instances {
-		if inst.Type == dbType.String() {
+		if projectInstanceTypeFromString(inst.Type) == countType {
 			count++
 		}
 	}
@@ -1577,9 +1608,9 @@ func getInstanceLimits(inst api.Instance, keys []string, skipUnset bool) (map[st
 				limit += sizeStateLimit
 			}
 		} else {
-			// Skip processing for 'limits.processes' if the instance type is VM,
-			// as this limit is only applicable to containers.
-			if key == "limits.processes" && inst.Type == instancetype.VM.String() {
+			// Skip processing for 'limits.processes' if the instance type is VM
+			// or smol-vm, as this limit is only applicable to containers.
+			if key == "limits.processes" && projectInstanceTypeFromString(inst.Type) == instancetype.VM {
 				continue
 			}
 

@@ -163,6 +163,119 @@ func TestAllowInstanceCreation_AboveInstances(t *testing.T) {
 	assert.EqualError(t, err, `Reached maximum number of instances in project "p1"`)
 }
 
+// A smol-vm is allowed in a project that configures limits.virtual-machines, as
+// long as the shared virtual-machine count is below the limit. This also covers
+// that the smol-vm type is accepted at all once the project has limits set (it
+// was previously rejected as an unexpected instance type).
+func TestAllowInstanceCreation_SmolVMUnderVMLimit(t *testing.T) {
+	tx, cleanup := db.NewTestClusterTx(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
+	require.NoError(t, err)
+
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.virtual-machines": "5"})
+	require.NoError(t, err)
+
+	req := api.InstancesPost{
+		Name: "v1",
+		Type: api.InstanceTypeSmolVM,
+	}
+
+	err = project.AllowInstanceCreation(tx, "p1", req)
+	assert.NoError(t, err)
+}
+
+// A smol-vm counts against the shared limits.virtual-machines limit: an existing
+// smol-vm blocks the creation of a regular virtual-machine once the limit is
+// reached.
+func TestAllowInstanceCreation_SmolVMCountsTowardVMLimit(t *testing.T) {
+	tx, cleanup := db.NewTestClusterTx(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
+	require.NoError(t, err)
+
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.virtual-machines": "1"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
+		Project:      "p1",
+		Name:         "s1",
+		Type:         instancetype.SmolVM,
+		Architecture: 1,
+		Node:         "none",
+	})
+	require.NoError(t, err)
+
+	req := api.InstancesPost{
+		Name: "v1",
+		Type: api.InstanceTypeVM,
+	}
+
+	err = project.AllowInstanceCreation(tx, "p1", req)
+	assert.EqualError(t, err, `Reached maximum number of instances of type "virtual-machine" in project "p1"`)
+}
+
+// A regular virtual-machine counts against the shared limits.virtual-machines
+// limit when creating a smol-vm: the smol-vm create is rejected because the
+// shared quota is full (not because the type is unexpected).
+func TestAllowInstanceCreation_SmolVMBlockedByVMLimit(t *testing.T) {
+	tx, cleanup := db.NewTestClusterTx(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
+	require.NoError(t, err)
+
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.virtual-machines": "1"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
+		Project:      "p1",
+		Name:         "v1",
+		Type:         instancetype.VM,
+		Architecture: 1,
+		Node:         "none",
+	})
+	require.NoError(t, err)
+
+	req := api.InstancesPost{
+		Name: "s1",
+		Type: api.InstanceTypeSmolVM,
+	}
+
+	err = project.AllowInstanceCreation(tx, "p1", req)
+	assert.EqualError(t, err, `Reached maximum number of instances of type "smol-vm" in project "p1"`)
+}
+
+// A smol-vm is allowed in a restricted project (restricted=true), exercising the
+// restriction code paths that treat smol-vm as a virtual-machine.
+func TestAllowInstanceCreation_SmolVMRestrictedProject(t *testing.T) {
+	tx, cleanup := db.NewTestClusterTx(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
+	require.NoError(t, err)
+
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"restricted": "true"})
+	require.NoError(t, err)
+
+	req := api.InstancesPost{
+		Name: "s1",
+		Type: api.InstanceTypeSmolVM,
+		InstancePut: api.InstancePut{
+			Profiles: []string{},
+		},
+	}
+
+	err = project.AllowInstanceCreation(tx, "p1", req)
+	assert.NoError(t, err)
+}
+
 // If a direct targeting is blocked, the check fails.
 func TestCheckClusterTargetRestriction_RestrictedTrue(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
