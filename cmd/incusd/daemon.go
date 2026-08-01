@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +24,6 @@ import (
 
 	cowsqlClient "github.com/cowsql/go-cowsql/client"
 	"github.com/cowsql/go-cowsql/driver"
-	"github.com/gorilla/mux"
 	liblxc "github.com/lxc/go-lxc"
 	"golang.org/x/sys/unix"
 
@@ -77,9 +78,9 @@ import (
 	"github.com/lxc/incus/v7/shared/cancel"
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/proxy"
-	"github.com/lxc/incus/v7/shared/revert"
 	localtls "github.com/lxc/incus/v7/shared/tls"
 	"github.com/lxc/incus/v7/shared/util"
+	"github.com/lxc/incus/v7/shared/ws"
 )
 
 // A Daemon can respond to requests from a shared client.
@@ -155,7 +156,8 @@ type Daemon struct {
 	loggingController *logging.Controller
 
 	// Authorization.
-	authorizer auth.Authorizer
+	authorizer   *auth.Router
+	authorizerMu sync.Mutex
 
 	// Syslog listener cancel function.
 	syslogSocketCancel context.CancelFunc
@@ -228,15 +230,31 @@ func defaultDaemon() *Daemon {
 
 // APIEndpoint represents a URL in our API.
 type APIEndpoint struct {
-	Name    string             // Name for this endpoint.
-	Path    string             // Path pattern for this endpoint.
-	Aliases []APIEndpointAlias // Any aliases for this endpoint.
-	Get     APIEndpointAction
-	Head    APIEndpointAction
-	Put     APIEndpointAction
-	Post    APIEndpointAction
-	Delete  APIEndpointAction
-	Patch   APIEndpointAction
+	Name          string             // Name for this endpoint.
+	Path          string             // Path pattern for this endpoint.
+	Aliases       []APIEndpointAlias // Any aliases for this endpoint.
+	SuffixActions []APIEndpointSuffixAction
+	Get           APIEndpointAction
+	Head          APIEndpointAction
+	Put           APIEndpointAction
+	Post          APIEndpointAction
+	Delete        APIEndpointAction
+	Patch         APIEndpointAction
+}
+
+// APIEndpointSuffixAction represents actions handled on a sub-path of an
+// endpoint (for example "/1.0/images/{fingerprint}/export"). It is used when a
+// dedicated route would conflict with another multi-segment wildcard route
+// under http.ServeMux. The endpoint is registered as a subtree and the suffix
+// is matched against the request path at dispatch time.
+type APIEndpointSuffixAction struct {
+	Name   string // Path suffix this action applies to (e.g. "/export").
+	Get    APIEndpointAction
+	Head   APIEndpointAction
+	Put    APIEndpointAction
+	Post   APIEndpointAction
+	Delete APIEndpointAction
+	Patch  APIEndpointAction
 }
 
 // APIEndpointAlias represents an alias URL of and APIEndpoint in our API.
@@ -308,9 +326,15 @@ func allowPermission(objectType auth.ObjectType, entitlement auth.Entitlement, m
 		}
 
 		// Expansion function to deal with project inheritance.
+		var expandProjectErr error
 		expandProject := func(projectName string) string {
 			// Object types that aren't part of projects.
 			if slices.Contains([]auth.ObjectType{auth.ObjectTypeUser, auth.ObjectTypeServer, auth.ObjectTypeCertificate, auth.ObjectTypeStoragePool, auth.ObjectTypeNetworkIntegration}, objectType) {
+				return projectName
+			}
+
+			// Object types that are always addressed in the requested project.
+			if slices.Contains([]auth.ObjectType{auth.ObjectTypeProject, auth.ObjectTypeInstance}, objectType) {
 				return projectName
 			}
 
@@ -334,24 +358,36 @@ func allowPermission(objectType auth.ObjectType, entitlement auth.Entitlement, m
 			}
 
 			if objectType == auth.ObjectTypeProfile {
-				projectName = project.ProfileProjectFromRecord(p)
-			} else if objectType == auth.ObjectTypeStorageBucket {
-				projectName = project.StorageBucketProjectFromRecord(p)
-			} else if objectType == auth.ObjectTypeStorageVolume {
+				return project.ProfileProjectFromRecord(p)
+			}
+
+			if objectType == auth.ObjectTypeStorageBucket {
+				return project.StorageBucketProjectFromRecord(p)
+			}
+
+			if objectType == auth.ObjectTypeStorageVolume {
 				dbVolType, err := storagePools.VolumeTypeNameToDBType(muxVars[1])
 				if err != nil {
 					return projectName
 				}
 
-				projectName = project.StorageVolumeProjectFromRecord(p, dbVolType)
-			} else if objectType == auth.ObjectTypeNetworkZone {
-				projectName = project.NetworkZoneProjectFromRecord(p)
-			} else if slices.Contains([]auth.ObjectType{auth.ObjectTypeImage, auth.ObjectTypeImageAlias}, objectType) {
-				projectName = project.ImageProjectFromRecord(p)
-			} else if slices.Contains([]auth.ObjectType{auth.ObjectTypeNetwork, auth.ObjectTypeNetworkACL}, objectType) {
-				projectName = project.NetworkProjectFromRecord(p)
+				return project.StorageVolumeProjectFromRecord(p, dbVolType)
 			}
 
+			if objectType == auth.ObjectTypeNetworkZone {
+				return project.NetworkZoneProjectFromRecord(p)
+			}
+
+			if slices.Contains([]auth.ObjectType{auth.ObjectTypeImage, auth.ObjectTypeImageAlias}, objectType) {
+				return project.ImageProjectFromRecord(p)
+			}
+
+			if slices.Contains([]auth.ObjectType{auth.ObjectTypeNetwork, auth.ObjectTypeNetworkACL, auth.ObjectTypeNetworkAddressSet}, objectType) {
+				return project.NetworkProjectFromRecord(p)
+			}
+
+			// Fail closed rather than defaulting to the requested project, which could bypass confinement.
+			expandProjectErr = fmt.Errorf("No project expansion defined for object type %q", objectType)
 			return projectName
 		}
 
@@ -397,9 +433,43 @@ func allowPermission(objectType auth.ObjectType, entitlement auth.Entitlement, m
 			return nodes[0].Name
 		}
 
-		objectName, err := auth.ObjectFromRequest(r, objectType, expandProject, expandFingerprint, expandVolumeLocation, muxVars...)
+		// Expansion function for bucket location.
+		expandBucketLocation := func(projectName string, poolName string, bucketName string) string {
+			// The location field is only relevant in clusters.
+			if !d.serverClustered {
+				return ""
+			}
+
+			var bucket *db.StorageBucket
+
+			// Get the bucket record.
+			err := d.db.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+				poolID, err := tx.GetStoragePoolID(ctx, poolName)
+				if err != nil {
+					return err
+				}
+
+				bucket, err = tx.GetStoragePoolBucket(ctx, poolID, projectName, false, bucketName)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			})
+			if err != nil {
+				return ""
+			}
+
+			return bucket.Location
+		}
+
+		objectName, err := auth.ObjectFromRequest(r, objectType, expandProject, expandFingerprint, expandVolumeLocation, expandBucketLocation, muxVars...)
 		if err != nil {
 			return response.InternalError(fmt.Errorf("Failed to create authentication object: %w", err))
+		}
+
+		if expandProjectErr != nil {
+			return response.InternalError(fmt.Errorf("Failed to expand project for authorization: %w", expandProjectErr))
 		}
 
 		s := d.State()
@@ -620,7 +690,7 @@ func (d *Daemon) State() *state.State {
 	}
 }
 
-func (d *Daemon) createCmd(restAPI *mux.Router, apiVersion string, c APIEndpoint) {
+func (d *Daemon) createCmd(restAPI *http.ServeMux, apiVersion string, c APIEndpoint) {
 	var uri string
 	if c.Path == "" {
 		uri = fmt.Sprintf("/%s", apiVersion)
@@ -630,16 +700,32 @@ func (d *Daemon) createCmd(restAPI *mux.Router, apiVersion string, c APIEndpoint
 		uri = fmt.Sprintf("/%s", c.Path)
 	}
 
-	route := restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		// Resolve the action set for this request. Suffix actions allow a
+		// single subtree route to serve sub-paths (e.g. "/export") that would
+		// otherwise conflict with another multi-segment wildcard route. A local
+		// copy is used so concurrent requests don't race on the shared endpoint.
+		ep := c
+		for _, suffix := range c.SuffixActions {
+			if strings.HasSuffix(r.URL.Path, suffix.Name) {
+				ep.Get = suffix.Get
+				ep.Head = suffix.Head
+				ep.Put = suffix.Put
+				ep.Post = suffix.Post
+				ep.Delete = suffix.Delete
+				ep.Patch = suffix.Patch
+				break
+			}
+		}
 
 		// Block on daemon startup except for the "internal" and "os" APIs.
 		if !slices.Contains([]string{"internal", "os"}, apiVersion) {
 			select {
 			case <-d.setupChan:
 			default:
-				response := response.Unavailable(errors.New("Daemon is starting up"))
-				_ = response.Render(w)
+				_ = response.Unavailable(errors.New("Daemon is starting up")).Render(w)
 				return
 			}
 		}
@@ -702,6 +788,14 @@ func (d *Daemon) createCmd(restAPI *mux.Router, apiVersion string, c APIEndpoint
 			// Add authentication/authorization context data.
 			ctx := context.WithValue(r.Context(), request.CtxUsername, username)
 			ctx = context.WithValue(ctx, request.CtxProtocol, protocol)
+
+			// Flag requests made by the root user over the local unix socket.
+			if protocol == "unix" {
+				cred, err := ucred.GetCredFromContext(r.Context())
+				if err == nil && cred.Uid == uint32(0) {
+					ctx = context.WithValue(ctx, request.CtxUnixIsRoot, true)
+				}
+			}
 
 			// Add forwarded requestor data.
 			if protocol == "cluster" {
@@ -809,17 +903,17 @@ func (d *Daemon) createCmd(restAPI *mux.Router, apiVersion string, c APIEndpoint
 
 		switch r.Method {
 		case "GET":
-			resp = handleRequest(c.Get)
+			resp = handleRequest(ep.Get)
 		case "HEAD":
-			resp = handleRequest(c.Head)
+			resp = handleRequest(ep.Head)
 		case "PUT":
-			resp = handleRequest(c.Put)
+			resp = handleRequest(ep.Put)
 		case "POST":
-			resp = handleRequest(c.Post)
+			resp = handleRequest(ep.Post)
 		case "DELETE":
-			resp = handleRequest(c.Delete)
+			resp = handleRequest(ep.Delete)
 		case "PATCH":
-			resp = handleRequest(c.Patch)
+			resp = handleRequest(ep.Patch)
 		default:
 			resp = response.NotFound(fmt.Errorf("Method %q not found", r.Method))
 		}
@@ -837,13 +931,26 @@ func (d *Daemon) createCmd(restAPI *mux.Router, apiVersion string, c APIEndpoint
 				logger.Error("Failed writing error for HTTP response", logger.Ctx{"url": uri, "err": err, "writeErr": writeErr})
 			}
 		}
-	})
-
-	// If the endpoint has a canonical name then record it so it can be used to build URLS
-	// and accessed in the context of the request by the handler function.
-	if c.Name != "" {
-		route.Name(c.Name)
 	}
+
+	restAPI.HandleFunc(uri, handler)
+
+	// Endpoints with suffix actions are registered as a subtree so they can
+	// also serve their sub-paths (e.g. "/export"). The exact route above keeps
+	// the canonical (no trailing slash) URL from being redirected.
+	if len(c.SuffixActions) > 0 {
+		restAPI.HandleFunc(uri+"/", handler)
+	}
+}
+
+// pathVar returns the value of the named path variable from the request URL.
+//
+// The HTTP router (http.ServeMux) already URL-decodes path segments, so unlike
+// the previous gorilla/mux based implementation the value must not be unescaped
+// again. An error is returned to keep call sites uniform with the previous
+// url.PathUnescape based code.
+func pathVar(r *http.Request, name string) (string, error) {
+	return r.PathValue(name), nil
 }
 
 // have we setup shared mounts?
@@ -906,8 +1013,8 @@ func (d *Daemon) init() error {
 
 	var dbWarnings []dbCluster.Warning
 
-	// Set default authorizer.
-	d.authorizer, err = auth.LoadAuthorizer(d.shutdownCtx, auth.DriverTLS, logger.Log, d.clientCerts)
+	// Set up the authorization router.
+	d.authorizer, err = auth.NewRouter(d.shutdownCtx, logger.Log, d.clientCerts)
 	if err != nil {
 		return err
 	}
@@ -1093,7 +1200,8 @@ func (d *Daemon) init() error {
 		networkCert,
 		d.State,
 		cluster.Latency(d.config.RaftLatency),
-		cluster.LogLevel(clusterLogLevel))
+		cluster.LogLevel(clusterLogLevel),
+	)
 	if err != nil {
 		return err
 	}
@@ -1324,11 +1432,10 @@ func (d *Daemon) init() error {
 	d.gateway.HeartbeatOfflineThreshold = d.globalConfig.OfflineThreshold()
 	oidcIssuer, oidcClientID, oidcScope, oidcAudience, oidcClaim := d.globalConfig.OIDCServer()
 	syslogSocketEnabled := d.localConfig.SyslogSocket()
-	openfgaAPIURL, openfgaAPIToken, openfgaStoreID := d.globalConfig.OpenFGA()
 	instancePlacementScriptlet := d.globalConfig.InstancesPlacementScriptlet()
-	authorizationScriptlet := d.globalConfig.AuthorizationScriptlet()
 
 	d.endpoints.NetworkUpdateTrustedProxy(d.globalConfig.HTTPSTrustedProxy())
+	ws.SetTrustedOrigins(d.globalConfig.HTTPSAllowedWebsocketOrigin())
 	d.globalConfigMu.Unlock()
 
 	d.loggingController = logging.NewLoggingController(d.internalListener)
@@ -1353,20 +1460,10 @@ func (d *Daemon) init() error {
 		}
 	}
 
-	// Setup OpenFGA authorization.
-	if openfgaAPIURL != "" && openfgaStoreID != "" && openfgaAPIToken != "" {
-		err = d.setupOpenFGA(openfgaAPIURL, openfgaAPIToken, openfgaStoreID)
-		if err != nil {
-			return fmt.Errorf("Failed to configure OpenFGA: %w", err)
-		}
-	}
-
-	// Setup the authorization scriptlet.
-	if authorizationScriptlet != "" {
-		err = d.setupAuthorizationScriptlet(authorizationScriptlet)
-		if err != nil {
-			return err
-		}
+	// Setup authorization, loading every optional driver.
+	err = d.setupAuthorization(auth.DriverOpenFGA, auth.DriverScriptlet)
+	if err != nil {
+		return fmt.Errorf("Failed to configure authorization: %w", err)
 	}
 
 	// Setup BGP listener.
@@ -1604,6 +1701,12 @@ func (d *Daemon) init() error {
 }
 
 func (d *Daemon) startClusterTasks() {
+	// Get an updated cluster certificate if needed.
+	err := d.clusterSyncCertificate()
+	if err != nil {
+		logger.Warn("Failed to sync cluster certificate", logger.Ctx{"err": err})
+	}
+
 	// Add initial event listeners from global database members.
 	// Run asynchronously so that connecting to remote members doesn't delay starting up other cluster tasks.
 	go cluster.EventsUpdateListeners(d.State(), nil, d.events.Inject)
@@ -1842,40 +1945,83 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 	return err
 }
 
-// Setup OpenFGA.
-func (d *Daemon) setupOpenFGA(apiURL string, apiToken string, storeID string) error {
-	var err error
+// setupAuthorization builds the authorization router from the current global configuration.
+func (d *Daemon) setupAuthorization(reload ...string) error {
+	d.authorizerMu.Lock()
+	defer d.authorizerMu.Unlock()
 
-	if d.authorizer != nil {
-		err := d.authorizer.StopService(d.shutdownCtx)
-		if err != nil {
-			logger.Error("Failed to stop authorizer service", logger.Ctx{"error": err})
+	optional := map[string]auth.Authorizer{}
+
+	// Carry over the optional drivers we are not reloading from the running router.
+	for _, name := range []string{auth.DriverOpenFGA, auth.DriverScriptlet} {
+		if slices.Contains(reload, name) {
+			continue
+		}
+
+		authDriver := d.authorizer.LoadedDriver(name)
+		if authDriver != nil {
+			optional[name] = authDriver
 		}
 	}
 
-	if apiURL == "" || apiToken == "" || storeID == "" {
-		// Reset to default authorizer.
-		d.authorizer, err = auth.LoadAuthorizer(d.shutdownCtx, auth.DriverTLS, logger.Log, d.clientCerts)
+	if slices.Contains(reload, auth.DriverOpenFGA) {
+		openfgaAPIURL, openfgaAPIToken, openfgaStoreID, openfgaTLSIdentifier := d.globalConfig.OpenFGA()
+
+		// Stop the previously loaded OpenFGA driver if loaded.
+		previousOpenFGA := d.authorizer.LoadedDriver(auth.DriverOpenFGA)
+		if previousOpenFGA != nil {
+			err := previousOpenFGA.StopService(d.shutdownCtx)
+			if err != nil {
+				logger.Error("Failed to stop OpenFGA authorizer service", logger.Ctx{"error": err})
+			}
+		}
+
+		if openfgaAPIURL != "" && openfgaStoreID != "" && openfgaAPIToken != "" {
+			openfgaDriver, err := d.setupOpenFGA(openfgaAPIURL, openfgaAPIToken, openfgaStoreID, openfgaTLSIdentifier)
+			if err != nil {
+				return err
+			}
+
+			optional[auth.DriverOpenFGA] = openfgaDriver
+		}
+	}
+
+	if slices.Contains(reload, auth.DriverScriptlet) {
+		scriptletDriver, err := d.setupAuthorizationScriptlet(d.globalConfig.AuthorizationScriptlet())
 		if err != nil {
 			return err
 		}
 
-		return nil
+		if scriptletDriver != nil {
+			optional[auth.DriverScriptlet] = scriptletDriver
+		}
 	}
 
+	return d.authorizer.Configure(d.globalConfig.AuthorizationClientRoutes(), optional)
+}
+
+// setupAuthorizationScriptlet loads scriptlet driver.
+func (d *Daemon) setupAuthorizationScriptlet(scriptlet string) (auth.Authorizer, error) {
+	err := scriptletLoad.AuthorizationSet(scriptlet)
+	if err != nil {
+		return nil, fmt.Errorf("Failed saving authorization scriptlet: %w", err)
+	}
+
+	if scriptlet == "" {
+		return nil, nil
+	}
+
+	return auth.LoadAuthorizer(d.shutdownCtx, auth.DriverScriptlet, logger.Log, d.clientCerts)
+}
+
+// setupOpenFGA loads the OpenFGA authorization driver.
+func (d *Daemon) setupOpenFGA(apiURL string, apiToken string, storeID string, tlsIdentifier string) (auth.Authorizer, error) {
 	config := map[string]any{
-		"openfga.api.url":   apiURL,
-		"openfga.api.token": apiToken,
-		"openfga.store.id":  storeID,
+		"authorization.openfga.api.url":        apiURL,
+		"authorization.openfga.api.token":      apiToken,
+		"authorization.openfga.store.id":       storeID,
+		"authorization.openfga.tls.identifier": tlsIdentifier,
 	}
-
-	reverter := revert.New()
-	defer reverter.Fail()
-
-	reverter.Add(func() {
-		// Reset to default authorizer.
-		d.authorizer, _ = auth.LoadAuthorizer(d.shutdownCtx, auth.DriverTLS, logger.Log, d.clientCerts)
-	})
 
 	// Build the list of resources to update the model.
 	refreshResources := func() (*auth.Resources, error) {
@@ -2121,47 +2267,7 @@ func (d *Daemon) setupOpenFGA(apiURL string, apiToken string, storeID string) er
 		return &resources, nil
 	}
 
-	openfgaAuthorizer, err := auth.LoadAuthorizer(d.shutdownCtx, auth.DriverOpenFGA, logger.Log, d.clientCerts, auth.WithConfig(config), auth.WithResourcesFunc(refreshResources))
-	if err != nil {
-		return err
-	}
-
-	d.authorizer = openfgaAuthorizer
-
-	reverter.Success()
-	return nil
-}
-
-// Setup authorization scriptlet.
-func (d *Daemon) setupAuthorizationScriptlet(scriptlet string) error {
-	err := scriptletLoad.AuthorizationSet(scriptlet)
-	if err != nil {
-		return fmt.Errorf("Failed saving authorization scriptlet: %w", err)
-	}
-
-	if scriptlet == "" {
-		// Reset to default authorizer.
-		d.authorizer, err = auth.LoadAuthorizer(d.shutdownCtx, auth.DriverTLS, logger.Log, d.clientCerts)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	// Fail if not using the default tls or scriptlet authorizer.
-	switch d.authorizer.(type) {
-	case *auth.TLS, *auth.Scriptlet:
-		d.authorizer, err = auth.LoadAuthorizer(d.shutdownCtx, auth.DriverScriptlet, logger.Log, d.clientCerts)
-		if err != nil {
-			return err
-		}
-
-	default:
-		return errors.New("Attempting to setup scriptlet authorization while another authorizer is already set")
-	}
-
-	return nil
+	return auth.LoadAuthorizer(d.shutdownCtx, auth.DriverOpenFGA, logger.Log, d.clientCerts, auth.WithConfig(config), auth.WithResourcesFunc(refreshResources))
 }
 
 // Syslog listener.
@@ -2613,4 +2719,67 @@ func (d *Daemon) getLinstor() (*linstor.Client, error) {
 	}
 
 	return d.linstor, nil
+}
+
+// clusterSyncCertificate retrieves the cluster certificate from the leader and applies it
+// locally if it's a newer certificate for our existing private key. This catches up members
+// which were offline during a cluster certificate renewal.
+func (d *Daemon) clusterSyncCertificate() error {
+	// Skip if we're the leader.
+	leaderAddress, err := d.gateway.LeaderAddress()
+	if err != nil {
+		return err
+	}
+
+	if leaderAddress == d.localConfig.ClusterAddress() {
+		return nil
+	}
+
+	// Retrieve the leader's certificate.
+	leaderCert, err := localtls.GetRemoteCertificate(fmt.Sprintf("https://%s", leaderAddress), version.UserAgent)
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve cluster certificate from leader: %w", err)
+	}
+
+	leaderCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaderCert.Raw})
+
+	// Skip if the leader certificate doesn't match our private key (full cluster renewal).
+	networkCert := d.endpoints.NetworkCert()
+
+	_, err = tls.X509KeyPair(leaderCertPEM, networkCert.PrivateKey())
+	if err != nil {
+		return nil
+	}
+
+	// Skip if the leader certificate isn't newer than ours.
+	localCert, err := networkCert.PublicKeyX509()
+	if err != nil {
+		return err
+	}
+
+	if !leaderCert.NotBefore.After(localCert.NotBefore) {
+		return nil
+	}
+
+	// Write the new certificate to disk.
+	err = internalUtil.WriteCert(d.os.VarDir, "cluster", leaderCertPEM, networkCert.PrivateKey(), nil)
+	if err != nil {
+		return err
+	}
+
+	// Apply the new certificate.
+	newCert, err := internalUtil.LoadClusterCert(d.os.VarDir)
+	if err != nil {
+		return err
+	}
+
+	d.endpoints.NetworkUpdateCert(newCert)
+	d.gateway.NetworkUpdateCert(newCert)
+
+	// Resolve warning of this type.
+	_ = warnings.ResolveWarningsByLocalNodeAndType(d.db.Cluster, warningtype.UnableToUpdateClusterCertificate)
+
+	logger.Info("Updated cluster certificate from leader")
+
+	return nil
 }

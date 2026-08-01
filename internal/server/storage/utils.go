@@ -614,6 +614,12 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 			return -1, err
 		}
 
+		// Reject a rootfs symlink which could redirect writes to the host filesystem.
+		rootfsInfo, err := os.Lstat(rootfsPath)
+		if err == nil && !rootfsInfo.IsDir() {
+			return -1, fmt.Errorf("Image rootfs isn't a regular directory: %s", imageFile)
+		}
+
 		// Check for separate root file.
 		if util.PathExists(imageRootfsFile) {
 			err = os.MkdirAll(rootfsPath, 0o755)
@@ -628,7 +634,8 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 		}
 
 		// Check that the container image unpack has resulted in a rootfs dir.
-		if !util.PathExists(rootfsPath) {
+		rootfsInfo, err = os.Lstat(rootfsPath)
+		if err != nil || !rootfsInfo.IsDir() {
 			return -1, fmt.Errorf("Image is missing a rootfs: %s", imageFile)
 		}
 
@@ -730,14 +737,14 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 				return -1, err
 			}
 
-			defer from.Close()
+			defer logger.WarnOnError(from.Close, "Failed to close source file")
 
 			to, err := os.OpenFile(dstPath, unix.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0)
 			if err != nil {
 				return -1, err
 			}
 
-			defer to.Close()
+			defer logger.WarnOnError(to.Close, "Failed to close destination file")
 
 			_, err = util.SafeCopy(to, from)
 			if err != nil {
@@ -810,7 +817,7 @@ func ImageUnpack(imageFile string, vol drivers.Volume, destBlockFile string, sys
 			return -1, err
 		}
 
-		defer func() { _ = os.RemoveAll(tempDir) }()
+		defer logger.WarnOnError(func() error { return os.RemoveAll(tempDir) }, "Failed to remove temporary directory")
 
 		// Unpack the whole image.
 		err = archive.Unpack(imageFile, tempDir, vol.IsBlockBacked(), maxMemory, tracker)
@@ -1141,10 +1148,32 @@ func InstanceDiskBlockSize(pool Pool, inst instance.Instance, op *operations.Ope
 		return -1, err
 	}
 
-	defer func() { _ = InstanceUnmount(pool, inst, op) }()
+	defer logger.WarnOnError(func() error { return InstanceUnmount(pool, inst, op) }, "Failed to unmount instance")
 
 	if mountInfo.DiskPath == "" {
 		return -1, errors.New("No disk path available from mount")
+	}
+
+	volType, err := InstanceTypeToVolumeType(inst.Type())
+	if err != nil {
+		return -1, err
+	}
+
+	dbVol, err := VolumeDBGet(pool, inst.Project().Name, inst.Name(), volType)
+	if err != nil {
+		return -1, err
+	}
+
+	vol := pool.GetVolume(volType, InstanceContentType(inst), project.Instance(inst.Project().Name, inst.Name()), dbVol.Config)
+
+	// For qcow2 volumes, use the virtual size as the device is larger to hold the qcow2 metadata.
+	if drivers.IsQcow2Block(vol) {
+		imgInfo, err := drivers.Qcow2Info(mountInfo.DiskPath)
+		if err != nil {
+			return -1, err
+		}
+
+		return int64(imgInfo.VirtualSize), nil
 	}
 
 	blockDiskSize, err := drivers.BlockDiskSizeBytes(mountInfo.DiskPath)
@@ -1444,8 +1473,11 @@ func DependentVolumesMatchMigrationType(s *state.State, migrationDependentVolume
 // needs to be migrated for this instance. Returns false if migration
 // can be skipped (e.g., on shared storage within the same cluster).
 func ShouldMigrateDependentVolume(s *state.State, poolName string, volumeName string, overrides map[string]string, clusterMove bool) (bool, error) {
-	if overrides != nil && ((overrides["source"] != "" && volumeName != overrides["source"]) || (overrides["pool"] != "" && poolName != overrides["pool"])) {
-		return true, nil
+	if overrides != nil {
+		overrideVolName, _ := internalInstance.SplitVolumeSource(overrides["source"])
+		if (overrides["source"] != "" && volumeName != overrideVolName) || (overrides["pool"] != "" && poolName != overrides["pool"]) {
+			return true, nil
+		}
 	}
 
 	diskPool, err := LoadByName(s, poolName)
@@ -1551,7 +1583,8 @@ func DevicesMapFromBackupConfig(config *backupConfig.Config) map[string]map[stri
 			devicesMap[dev["pool"]] = map[string]string{}
 		}
 
-		devicesMap[dev["pool"]][dev["source"]] = devName
+		volName, _ := internalInstance.SplitVolumeSource(dev["source"])
+		devicesMap[dev["pool"]][volName] = devName
 	}
 
 	return devicesMap

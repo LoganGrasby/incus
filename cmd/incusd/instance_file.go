@@ -7,14 +7,12 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/pkg/sftp"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
@@ -33,7 +31,7 @@ func instanceFileHandler(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -153,6 +151,8 @@ func instanceFileHandler(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceFileGet(s *state.State, inst instance.Instance, path string, r *http.Request) response.Response {
@@ -225,6 +225,8 @@ func instanceFileGet(s *state.State, inst instance.Instance, path string, r *htt
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceFileHead(_ *state.State, inst instance.Instance, path string, _ *http.Request) response.Response {
@@ -311,6 +313,8 @@ func instanceFileHead(_ *state.State, inst instance.Instance, path string, _ *ht
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceFilePost(s *state.State, inst instance.Instance, path string, r *http.Request) response.Response {
@@ -320,7 +324,7 @@ func instanceFilePost(s *state.State, inst instance.Instance, path string, r *ht
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = client.Close() }()
+	defer logger.WarnOnError(client.Close, "Failed to close SFTP client")
 
 	return fileSFTPPost(client, path, r, func() {
 		s.Events.SendLifecycle(inst.Project().Name, lifecycle.InstanceFilePushed.Event(inst, logger.Ctx{"path": path}))
@@ -367,6 +371,8 @@ func instanceFilePost(s *state.State, inst instance.Instance, path string, r *ht
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceFileDelete(s *state.State, inst instance.Instance, path string, r *http.Request) response.Response {
@@ -376,7 +382,7 @@ func instanceFileDelete(s *state.State, inst instance.Instance, path string, r *
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = client.Close() }()
+	defer logger.WarnOnError(client.Close, "Failed to close SFTP client")
 
 	return fileSFTPDelete(client, path, r, func() {
 		s.Events.SendLifecycle(inst.Project().Name, lifecycle.InstanceFileDeleted.Event(inst, logger.Ctx{"path": path}))
@@ -561,7 +567,7 @@ func fileSFTPPost(client *sftp.Client, path string, r *http.Request, onSuccess f
 			return response.SmartError(err)
 		}
 
-		defer func() { _ = file.Close() }()
+		defer logger.WarnOnError(file.Close, "Failed to close file")
 
 		// Go to the end of the file.
 		_, err = file.Seek(0, io.SeekEnd)

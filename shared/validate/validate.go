@@ -367,7 +367,7 @@ func IsNetworkAddressV4(value string) error {
 }
 
 // IsNetworkAddressCIDRV4 validates an IPv4 address string in CIDR format.
-func IsNetworkAddressCIDRV4(value string) error {
+func IsNetworkAddressCIDRV4(value string, allowSingle bool) error {
 	ip, subnet, err := net.ParseCIDR(value)
 	if err != nil {
 		return err
@@ -375,6 +375,12 @@ func IsNetworkAddressCIDRV4(value string) error {
 
 	if ip.To4() == nil {
 		return fmt.Errorf("Not an IPv4 address %q", value)
+	}
+
+	subnetSize, _ := subnet.Mask.Size()
+	if allowSingle && subnetSize == 32 {
+		// Single addresses are allowed through.
+		return nil
 	}
 
 	if ip.String() == subnet.IP.String() {
@@ -430,7 +436,7 @@ func IsNetworkAddressV6(value string) error {
 }
 
 // IsNetworkAddressCIDRV6 validates an IPv6 address string in CIDR format.
-func IsNetworkAddressCIDRV6(value string) error {
+func IsNetworkAddressCIDRV6(value string, allowSingle bool) error {
 	ip, subnet, err := net.ParseCIDR(value)
 	if err != nil {
 		return err
@@ -438,6 +444,12 @@ func IsNetworkAddressCIDRV6(value string) error {
 
 	if ip.To4() != nil {
 		return fmt.Errorf("Not an IPv6 address %q", value)
+	}
+
+	subnetSize, _ := subnet.Mask.Size()
+	if allowSingle && subnetSize == 128 {
+		// Single addresses are allowed through.
+		return nil
 	}
 
 	if ip.String() == subnet.IP.String() {
@@ -608,6 +620,16 @@ func IsUUID(value string) error {
 	return nil
 }
 
+// IsSHA256 validates whether a value is a SHA-256 hash in hex form.
+func IsSHA256(value string) error {
+	match, _ := regexp.MatchString(`^[0-9a-f]{64}$`, value)
+	if !match {
+		return errors.New("Invalid SHA-256 hash")
+	}
+
+	return nil
+}
+
 // IsPCIAddress validates whether a value is a PCI address.
 func IsPCIAddress(value string) error {
 	match, _ := regexp.MatchString(`^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$`, value)
@@ -638,6 +660,14 @@ func IsCompressionAlgorithm(value string) error {
 
 	if len(fields) == 0 {
 		return errors.New("Invalid compressor provided")
+	}
+
+	// Only allow known-safe arguments (compression levels) to avoid argument injection.
+	allowedArgs := []string{"-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "--rsyncable"}
+	for _, arg := range fields[1:] {
+		if !slices.Contains(allowedArgs, arg) {
+			return fmt.Errorf("Compression algorithm argument %q isn't allowed", arg)
+		}
 	}
 
 	// Check that we're dealing with a supported option.
@@ -818,29 +848,6 @@ func IsHostname(name string) error {
 
 	if !match {
 		return errors.New("Name can only contain alphanumeric and hyphen characters")
-	}
-
-	return nil
-}
-
-// IsDeviceName checks name is 1-63 characters long, doesn't start with a full stop and contains only alphanumeric,
-// forward slash, hyphen, colon, underscore and full stop characters.
-func IsDeviceName(name string) error {
-	if len(name) < 1 || len(name) > 63 {
-		return errors.New("Name must be 1-63 characters long")
-	}
-
-	if string(name[0]) == "." {
-		return errors.New(`Name must not start with "." character`)
-	}
-
-	match, err := regexp.MatchString(`^[\/\.\-:_a-zA-Z0-9]+$`, name)
-	if err != nil {
-		return err
-	}
-
-	if !match {
-		return errors.New("Name can only contain alphanumeric, forward slash, hyphen, colon, underscore and full stop characters")
 	}
 
 	return nil
@@ -1033,6 +1040,26 @@ func IsBase64(value string) error {
 	_, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(value, "="))
 	if err != nil {
 		return fmt.Errorf("Invalid value for a base64 string %q: %w", value, err)
+	}
+
+	return nil
+}
+
+// IsSELinuxType validates whether the string is valid as SELinux type.
+func IsSELinuxType(value string) error {
+	match, _ := regexp.MatchString(`^[a-z]+[0-9a-z_]*_t$`, value)
+	if !match {
+		return errors.New("Invalid value, must be SELinux type string (e.g. container_init_t)")
+	}
+
+	return nil
+}
+
+// IsSELinuxLevel validates whether the string is valid as SELinux MLS/MCS level.
+func IsSELinuxLevel(value string) error {
+	match, _ := regexp.MatchString(`^s\d+(-s\d+)?(:c\d+(\.c\d+)?(,c\d+(\.c\d+)?)*)?$`, value)
+	if !match {
+		return errors.New("Invalid value, must be SELinux level (e.g. s0:c1,c2)")
 	}
 
 	return nil

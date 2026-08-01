@@ -721,7 +721,15 @@ func InstanceNeedsIntercept(s *state.State, c Instance) (bool, error) {
 func MakePidFd(pid int) (int, *os.File, error) {
 	pidFdFile, err := linux.PidFdOpen(pid, 0)
 	if err != nil {
-		return -1, nil, err
+		// The kernel requires PIDFD_THREAD for non-leader threads.
+		if !errors.Is(err, unix.EINVAL) {
+			return -1, nil, err
+		}
+
+		pidFdFile, err = linux.PidFdOpen(pid, C.PIDFD_THREAD)
+		if err != nil {
+			return -1, nil, err
+		}
 	}
 
 	return 3, pidFdFile, nil
@@ -1227,7 +1235,7 @@ func CallForkmknod(c Instance, dev deviceConfig.Device, requestPID int, s *state
 		return int(-C.EPERM)
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close pidfd")
 
 	_, stderr, err := subprocess.RunCommandSplit(
 		context.TODO(),
@@ -1244,7 +1252,8 @@ func CallForkmknod(c Instance, dev deviceConfig.Device, requestPID int, s *state
 		fmt.Sprintf("%d", uid),
 		fmt.Sprintf("%d", gid),
 		fmt.Sprintf("%d", fsuid),
-		fmt.Sprintf("%d", fsgid))
+		fmt.Sprintf("%d", fsgid),
+	)
 	if err != nil {
 		errno, err := strconv.Atoi(stderr)
 		if err != nil || errno == C.ENOANO {
@@ -1443,7 +1452,7 @@ func (srv *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 		return 0
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close pidfd")
 
 	uid, gid, fsuid, fsgid, err := TaskIDs(args.pid)
 	if err != nil {
@@ -1529,7 +1538,8 @@ func (srv *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 		fmt.Sprintf("%d", args.flags),
 		fmt.Sprintf("%d", whiteout),
 		fmt.Sprintf("%d", args.size),
-		string(args.value))
+		string(args.value),
+	)
 	if err != nil {
 		errno, err := strconv.Atoi(stderr)
 		if err != nil || errno == C.ENOANO {
@@ -1580,7 +1590,7 @@ func (srv *Server) HandleSchedSetschedulerSyscall(c Instance, siov *Iovec) int {
 		return 0
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close pidfd")
 
 	uid, gid, _, _, err := TaskIDs(args.pidCaller)
 	if err != nil {
@@ -1787,7 +1797,7 @@ func (srv *Server) HandleSysinfoSyscall(c Instance, siov *Iovec) int {
 	instMetrics.Freeram = instMetrics.Totalram - uint64(memoryUsage) - instMetrics.Bufferram
 
 	// Get instance swap info.
-	if cgroup.Supports(cgroup.Memory) {
+	if cgroup.Supports(cgroup.MemorySwap) {
 		swapLimit, err := cg.GetMemorySwapLimit()
 		if err != nil {
 			l.Warn("Failed getting swap limit", logger.Ctx{"err": err})
@@ -2012,7 +2022,7 @@ func (srv *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 		return 0
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close pidfd")
 
 	mntSource := [unix.PathMax]C.char{}
 	mntTarget := [unix.PathMax]C.char{}
@@ -2160,13 +2170,14 @@ func (srv *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 			fmt.Sprintf("%d", args.pid),
 			fmt.Sprintf("%d", pidFdNr),
 			fmt.Sprintf("%d", 1),
-			fmt.Sprintf("%d", args.uid),
-			fmt.Sprintf("%d", args.gid),
-			fmt.Sprintf("%d", args.fsuid),
-			fmt.Sprintf("%d", args.fsgid),
+			fmt.Sprintf("%d", args.nsuid),
+			fmt.Sprintf("%d", args.nsgid),
+			fmt.Sprintf("%d", args.nsfsuid),
+			fmt.Sprintf("%d", args.nsfsgid),
 			fuseSource,
 			args.target,
-			fuseOpts)
+			fuseOpts,
+		)
 	} else {
 		_, _, err = subprocess.RunCommandSplit(
 			context.TODO(),
@@ -2191,10 +2202,12 @@ func (srv *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 			fmt.Sprintf("%d", args.nsgid),
 			fmt.Sprintf("%d", args.nsfsuid),
 			fmt.Sprintf("%d", args.nsfsgid),
-			args.data)
+			args.data,
+		)
 	}
 
 	if err != nil {
+		ctx["err"] = err
 		ctx["syscall_continue"] = "true"
 		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
 		return 0
@@ -2244,7 +2257,8 @@ func (srv *Server) HandleBpfSyscall(c Instance, siov *Iovec) int {
 		siov.resp,
 		&bpfCmd,
 		&bpfProgType,
-		&bpfAttachType, flags)
+		&bpfAttachType, flags,
+	)
 	runtime.UnlockOSThread()
 	ctx["bpf_cmd"] = fmt.Sprintf("%d", bpfCmd)
 	ctx["bpf_prog_type"] = fmt.Sprintf("%d", bpfProgType)

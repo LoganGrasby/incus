@@ -3152,3 +3152,194 @@ For example, `/1.0?target=foo#storage.logs_volume` refers to the
 This extends the `limits.cpu` configuration key for virtual machines to
 allow specifying an explicit CPU topology of the form
 `sockets=2,cores=4,threads=2`.
+
+## `instance_nbd`
+
+This adds a new `GET /1.0/instances/{name}/nbd` endpoint which acts
+similarly to the equivalent storage volume endpoint but allows concurrent
+access to all disks attached to the VM.
+
+## `network_bridge_bgp_instances`
+
+This adds the `bgp.ipv4.instances` and `bgp.ipv6.instances` configuration
+keys to managed bridge networks.
+
+When enabled, Incus advertises a `/32` (IPv4) or `/128` (IPv6) route over
+BGP for each running instance connected to the network, withdrawing it
+again when the instance stops.
+
+## `core_https_allowed_websocket_origin`
+
+This adds a new `core.https_allowed_websocket_origin` server
+configuration key. It can be set to a comma-separate list of allowed
+origins or to the `*` wildcard.
+
+## `storage_btrfs_compression`
+
+This adds a new `btrfs.compression` storage volume configuration key for
+the `btrfs` driver. It maps to the Btrfs `compression` property and takes
+the same values (for example `zstd`, `lzo`, `zlib` or `none`).
+
+## `oci_network_config`
+
+This allows for static network configuration of OCI application containers.
+
+The NIC `ipv4.address` and `ipv6.address` keys can now be set to a CIDR
+value to statically configure the address inside the container and the new
+`ipv4.gateway` and `ipv6.gateway` keys can be used to set the default
+gateway. Setting either address to `none` prevents any configuration for
+that address family and stops the built-in DHCP client from running on it.
+
+For DNS, the `oci.dns.nameservers`, `oci.dns.domain` and `oci.dns.search`
+instance configuration keys can be used to set the initial content of the
+container's `resolv.conf`, which is then extended with any value received
+over DHCP.
+
+All of those keys are only valid for OCI containers.
+
+## `infiniband_sriov_guid`
+
+This adds two new configuration keys, `node_guid` and `port_guid`, to
+`infiniband` devices using the `sriov` `nictype`.
+
+When set, the matching GUID of the allocated virtual function is changed
+to the provided value when the instance starts and restored to its
+original value when the instance stops.
+
+## `instance_selinux`
+
+This adds per-instance SELinux integration for containers and virtual
+machines, with automatic MCS level allocation for isolation between
+instances on the same host.
+
+The following instance configuration keys are added:
+
+* `security.selinux.domain`: Override the SELinux process domain.
+* `security.selinux.type`: Override the SELinux file type used for the
+  instance storage.
+* `security.selinux.level`: Override the SELinux MCS level.
+* `security.selinux.label_rootfs`: Control rootfs labeling behavior
+  (`auto`, `always` or `never`).
+
+The computed context is persisted in the `volatile.selinux.context` key so
+that MCS ranges stay stable across restarts.
+
+## `network_bgp_peer_interface`
+
+This adds a new `bgp.peers.NAME.interface` configuration key to `bridge`
+and `physical` networks as an alternative to `bgp.peers.NAME.address`.
+
+When set, the BGP session is established over the given interface using
+BGP unnumbered (the peer's IPv6 link-local address is discovered
+automatically and IPv4 routes are exchanged using extended next-hop).
+
+## `projects_restricted_virtual_machines_nesting`
+
+This adds a new `restricted.virtual-machines.nesting` project configuration key.
+
+When set to `block`, all virtual machines in the project must have
+`security.nesting` set to `false`, turning off nested virtualization.
+
+## `authorization_config`
+
+This moves the authorization configuration keys under a general
+`authorization.*` namespace.
+
+The following server configuration keys replace the former `openfga.*` keys:
+
+* `authorization.openfga.api.url`: URL of the OpenFGA server
+* `authorization.openfga.api.token`: API token of the OpenFGA server
+* `authorization.openfga.store.id`: ID of the OpenFGA permission store
+
+Existing `openfga.*` values are automatically migrated to the new keys on
+upgrade.
+
+## `network_allocations_network`
+Adds the `network` field to the network allocations API response.
+
+## `gpu_native_context`
+
+This adds a new `native-context` `gputype` for `gpu` devices on virtual machines.
+Instead of passing through a PCI device, it gives the VM an accelerated `virtio-gpu`
+that uses DRM native context, so the guest's own driver drives the host GPU
+directly, with graphics and video acceleration. One host GPU can be shared by several
+VMs and the host keeps using it. The `blob.size` device option sets the
+host-visible blob window (default 2GiB). Requires QEMU 11.0.0 or newer.
+
+## `instance_port_forward`
+
+This adds a new `POST /1.0/instances/NAME/port-forward` API endpoint which
+upgrades the connection to a raw TCP connection to the specified address
+and port inside of the instance.
+
+For containers, the connection is established directly by the server from
+within the container's network namespace. For virtual machines, the request
+is forwarded to the `incus-agent` which then handles the connection, this
+is controlled by the new `port-forward` agent feature.
+
+A matching `incus port-forward` command is added to the client, providing
+a local TCP listener which forwards every connection to the instance.
+
+## `unix_block_limits`
+
+This adds the `limits.read` and `limits.write` configuration keys to
+`unix-block` devices. These behave similarly to their `disk` device
+equivalents, accepting either a byte/s value or an IOPS value.
+
+## `authorization_client_routing`
+
+This allows loading multiple authorization drivers at once and routing each
+request to one of them based on the authentication class of the client.
+
+The following server configuration keys are added:
+
+* `authorization.client.default`: driver for clients without a more specific class route
+* `authorization.client.unix`: driver for local (`unix` socket) clients
+* `authorization.client.tls`: driver for unrestricted TLS clients
+* `authorization.client.tls-restricted`: driver for restricted (project-scoped) TLS clients
+* `authorization.client.oidc`: driver for OIDC-authenticated clients
+
+Each key accepts one of `allow`, `deny`, `openfga` or `scriptlet`. A per-class
+key falls back to `authorization.client.default` when unset.
+
+`authorization.client.tls-restricted` additionally accepts `tls`, as the TLS
+authorization method exists to enforce the per-certificate project restrictions
+that only apply to restricted certificates.
+
+The following server configuration key is also added:
+
+* `authorization.openfga.tls.identifier`: certificate attribute (`fingerprint`
+  or `name`) used as the OpenFGA user when a TLS client is authorized by
+  OpenFGA (defaults to `name`).
+
+## `instance_nvram`
+
+This adds new endpoints to manage virtual machines’ UEFI variables:
+
+* `GET /1.0/instances/{name}/nvram`, to get all UEFI variables
+* `GET /1.0/instances/{name}/nvram/{guid}`, to get UEFI variables under the given GUID
+* `GET /1.0/instances/{name}/nvram/{guid}/{var}`, to get specific UEFI variables
+* `DELETE /1.0/instances/{name}/nvram/{guid}/{var}`, to delete specific UEFI variables
+* `PUT /1.0/instances/{name}/nvram/{guid}/{var}`, to set/update specific UEFI variables
+
+It also adds `rebuild-nvram` as an instance debug action.
+
+## `disk_io_limits_combined`
+
+This makes it possible to set both a byte/s limit and an IOPS limit at the
+same time in the I/O limit keys of `disk` and `unix-block` devices by using
+a comma separated list of values (for example, `limits.read=30MiB,1000iops`).
+
+## `resources_cpu_cluster`
+
+Adds a `cluster` field to CPU core entries in the resources API, telling
+apart cores with identical identifiers on systems where core identifiers
+are only unique within a CPU cluster (ARM big.LITTLE).
+
+## `acme_eab`
+
+Adds support for ACME External Account Binding (EAB) through two new
+server configuration keys:
+
+* `acme.eab.kid`
+* `acme.eab.hmac`

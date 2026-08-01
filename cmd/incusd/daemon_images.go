@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/units"
 	"github.com/lxc/incus/v7/shared/util"
+	"github.com/lxc/incus/v7/shared/validate"
 )
 
 // imageDownloadArgs used with imageDownload.
@@ -136,6 +138,18 @@ func imageDownload(ctx context.Context, r *http.Request, s *state.State, op *ope
 			entry, _, err := remote.GetImageAliasType(args.Type, fp)
 			if err == nil {
 				fp = entry.Target
+			} else if args.Type != "" {
+				// If no match was found for the requested type, check whether
+				// the other instance type has one to give a more helpful hint.
+				otherType := "virtual-machine"
+				if args.Type == "virtual-machine" {
+					otherType = "container"
+				}
+
+				_, _, otherErr := remote.GetImageAliasType(otherType, fp)
+				if otherErr == nil {
+					return nil, false, fmt.Errorf("The requested image couldn't be found for instance type %q, but one was found for instance type %q", args.Type, otherType)
+				}
 			}
 
 			// Expand partial fingerprints
@@ -331,6 +345,14 @@ func imageDownload(ctx context.Context, r *http.Request, s *state.State, op *ope
 
 	logger.Info("Downloading image", ctxMap)
 
+	// The fingerprint is used as a file name, so reject anything that isn't a
+	// partial or full hex fingerprint to avoid path traversal. It's re-validated
+	// as a full SHA-256 once expanded from the remote below.
+	match, _ := regexp.MatchString("^[0-9a-f]{1,64}$", fp)
+	if !match {
+		return nil, false, errors.New("Invalid image fingerprint")
+	}
+
 	// Cleanup any leftover from a past attempt
 	destDir := internalUtil.VarPath("images")
 	destName := filepath.Join(destDir, fp)
@@ -373,14 +395,14 @@ func imageDownload(ctx context.Context, r *http.Request, s *state.State, op *ope
 			return nil, false, err
 		}
 
-		defer func() { _ = dest.Close() }()
+		defer logger.WarnOnErrorExcept(dest.Close, []error{os.ErrClosed}, "Failed to close image file")
 
 		destRootfs, err := os.Create(destName + ".rootfs")
 		if err != nil {
 			return nil, false, err
 		}
 
-		defer func() { _ = destRootfs.Close() }()
+		defer logger.WarnOnErrorExcept(destRootfs.Close, []error{os.ErrClosed}, "Failed to close rootfs file")
 
 		// Get the image information
 		if info == nil {
@@ -518,7 +540,7 @@ func imageDownload(ctx context.Context, r *http.Request, s *state.State, op *ope
 			return nil, false, err
 		}
 
-		defer func() { _ = f.Close() }()
+		defer logger.WarnOnErrorExcept(f.Close, []error{os.ErrClosed}, "Failed to close image file")
 
 		// Hashing
 		hash256 := sha256.New()
@@ -579,12 +601,31 @@ func imageDownload(ctx context.Context, r *http.Request, s *state.State, op *ope
 		// Create the database entry
 		return tx.CreateImage(ctx, args.ProjectName, info.Fingerprint, info.Filename, info.Size, info.Public, info.AutoUpdate, info.Architecture, info.CreatedAt, info.ExpiresAt, info.Properties, info.Type, nil)
 	})
+	if err != nil && api.StatusErrorCheck(err, http.StatusConflict) {
+		// Another cluster member created the record concurrently, reuse it and just register this member.
+		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+			_, info, err = tx.GetImage(ctx, info.Fingerprint, cluster.ImageFilter{Project: &args.ProjectName})
+			if err != nil {
+				return err
+			}
+
+			return tx.AddImageToLocalNode(ctx, args.ProjectName, info.Fingerprint)
+		})
+	}
+
 	if err != nil {
 		return nil, false, fmt.Errorf("Failed creating image record: %w", err)
 	}
 
 	// Image is in the DB now, don't wipe on-disk files on failure
 	failure = false
+
+	// Re-validate the fingerprint as it may have been updated from the remote
+	// server's response, and it is used as a file name below.
+	err = validate.IsSHA256(fp)
+	if err != nil {
+		return nil, false, errors.New("Invalid image fingerprint")
+	}
 
 	// Check if the image path changed (private images)
 	newDestName := filepath.Join(destDir, fp)

@@ -3,14 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-
-	"github.com/gorilla/mux"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	"github.com/lxc/incus/v7/internal/server/auth"
@@ -20,6 +18,7 @@ import (
 	"github.com/lxc/incus/v7/internal/server/response"
 	"github.com/lxc/incus/v7/internal/server/storage"
 	"github.com/lxc/incus/v7/internal/version"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/revert"
 )
 
@@ -101,17 +100,21 @@ var instanceExecOutputsCmd = APIEndpoint{
 //	            [
 //	              "/1.0/instances/foo/logs/lxc.log"
 //	            ]
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -194,13 +197,15 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -225,7 +230,7 @@ func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	file, err := pathVar(r, "file")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -278,13 +283,15 @@ func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -309,7 +316,7 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	file, err := pathVar(r, "file")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -381,17 +388,21 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 //	              "/1.0/instances/foo/logs/exec-output/exec_d0a89537-0617-4ed6-a79b-c2e88a970965.stdout",
 //	              "/1.0/instances/foo/logs/exec-output/exec_d0a89537-0617-4ed6-a79b-c2e88a970965.stderr",
 //	            ]
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -427,10 +438,18 @@ func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = pool.UnmountInstance(inst, nil) }()
+	defer logger.WarnOnError(func() error { return pool.UnmountInstance(inst, nil) }, "Failed to unmount instance")
+
+	// Confine access to the exec output directory to avoid following symlinks.
+	root, err := os.OpenRoot(inst.ExecOutputPath())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close exec output root")
 
 	// Read exec record-output files
-	dents, err := os.ReadDir(inst.ExecOutputPath())
+	dents, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -487,6 +506,8 @@ func instanceExecOutputsGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
@@ -496,7 +517,7 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -521,7 +542,7 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	file, err := pathVar(r, "file")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -542,13 +563,40 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	reverter.Add(func() { _ = pool.UnmountInstance(inst, nil) })
+
+	// Confine access to the exec output directory to avoid following symlinks.
+	root, err := os.OpenRoot(inst.ExecOutputPath())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	reverter.Add(func() { _ = root.Close() })
+
+	f, err := root.Open(file)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return response.NotFound(fmt.Errorf("Exec record-output file %q not found", file))
+		}
+
+		return response.SmartError(err)
+	}
+
+	reverter.Add(func() { _ = f.Close() })
+
+	fi, err := f.Stat()
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	cleanup := reverter.Clone()
 	reverter.Success()
 
 	ent := response.FileResponseEntry{
-		Path:     filepath.Join(inst.ExecOutputPath(), file),
-		Filename: file,
-		Cleanup:  cleanup.Fail,
+		File:         f,
+		FileSize:     fi.Size(),
+		FileModified: fi.ModTime(),
+		Filename:     file,
+		Cleanup:      cleanup.Fail,
 	}
 
 	s.Events.SendLifecycle(projectName, lifecycle.InstanceLogRetrieved.Event(file, inst, request.CreateRequestor(r), nil))
@@ -590,13 +638,15 @@ func instanceExecOutputGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceExecOutputDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -621,7 +671,7 @@ func instanceExecOutputDelete(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	file, err := pathVar(r, "file")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -641,9 +691,17 @@ func instanceExecOutputDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = pool.UnmountInstance(inst, nil) }()
+	defer logger.WarnOnError(func() error { return pool.UnmountInstance(inst, nil) }, "Failed to unmount instance")
 
-	err = os.Remove(filepath.Join(inst.ExecOutputPath(), file))
+	// Confine access to the exec output directory to avoid following symlinks.
+	root, err := os.OpenRoot(inst.ExecOutputPath())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close exec output root")
+
+	err = root.Remove(file)
 	if err != nil {
 		return response.SmartError(err)
 	}

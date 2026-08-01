@@ -136,6 +136,10 @@ type InstanceServer interface {
 	GetInstanceFileSFTPConn(instanceName string) (net.Conn, error)
 	GetInstanceFileSFTP(instanceName string) (*sftp.Client, error)
 
+	GetInstanceNBDConn(instanceName string, args InstanceNBDArgs) (net.Conn, error)
+
+	GetInstancePortForwardConn(instanceName string, forward api.InstancePortForwardPost) (net.Conn, error)
+
 	GetInstanceSnapshotNames(instanceName string) (names []string, err error)
 	GetInstanceSnapshots(instanceName string) (snapshots []api.InstanceSnapshot, err error)
 	GetInstanceSnapshot(instanceName string, name string) (snapshot *api.InstanceSnapshot, ETag string, err error)
@@ -174,6 +178,14 @@ type InstanceServer interface {
 	DeleteInstanceTemplateFile(name string, templateName string) (err error)
 
 	GetInstanceDebugMemory(name string, format string) (rc io.ReadCloser, err error)
+	RepairInstance(name string, repair api.InstanceDebugRepairPost) (err error)
+	GetInstanceNVRAM(name string) (vars map[string]map[string]*api.InstanceNVRAMVariable, err error)
+	GetInstanceNVRAMGUID(name string, guid string) (vars map[string]*api.InstanceNVRAMVariable, err error)
+	GetRawInstanceNVRAMGUIDVar(name string, guid string, varName string) (resp []byte, attributes uint32, err error)
+	GetInstanceNVRAMGUIDVar(name string, guid string, varName string) (resp *api.InstanceNVRAMVariable, ETag string, err error)
+	DeleteInstanceNVRAMGUIDVar(name string, guid string, varName string) error
+	UpdateRawInstanceNVRAMGUIDVar(name string, guid string, varName string, data []byte, attributes uint32, timestamp int64) error
+	UpdateInstanceNVRAMGUIDVar(name string, guid string, varName string, data api.InstanceNVRAMVariablePut, ETag string) error
 
 	// Event handling functions
 	GetEvents() (listener *EventListener, err error)
@@ -408,6 +420,7 @@ type InstanceServer interface {
 	// Storage volume bitmaps manipulations functions ("storage_volume_nbd" API extension)
 	GetStorageVolumeBitmapNames(pool string, volumeType string, volumeName string) ([]string, error)
 	GetStorageVolumeBitmaps(pool string, volumeType string, volumeName string) ([]api.StorageVolumeBitmap, error)
+	GetStorageVolumeBitmap(pool string, volumeType string, volumeName string, bitmapName string) (bitmap *api.StorageVolumeBitmap, err error)
 	CreateStorageVolumeBitmap(pool string, volumeType string, volumeName string, bitmap api.StorageVolumeBitmapsPost) error
 	DeleteStorageVolumeBitmap(pool string, volumeType string, volumeName string, bitmapName string) error
 
@@ -719,6 +732,13 @@ type InstanceFileArgs struct {
 
 	// File write mode (overwrite or append)
 	WriteMode string
+}
+
+// The InstanceNBDArgs struct is used when connecting to an instance's disks over NBD.
+// API extension: instance_nbd.
+type InstanceNBDArgs struct {
+	// Whether to connect to an already running NBD session
+	Reuse bool
 }
 
 // The InstanceFileResponse struct is used as part of the response for a instance file download.

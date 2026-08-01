@@ -118,6 +118,7 @@ Tag                         | Description
 `leftjoin=<table.column>`   | Applies a `LEFT JOIN` of the same form as a `JOIN`.
 `joinon=<table>.<column>`   | Overrides the default `JOIN ON` clause with the given table and column, replacing `<table>.<joinTable_id>` above.
 `jointo=<column>`           | Overrides the default target column `id` with the given column, replacing the `id` in `<joinTable.id>` above. This is intended for "loose" foreign keys, not using the ID column. Therefore, this is intended to be used in conjunction with `joinon` and `omit=create,update` to get the expected behavior.
+`joinas=<alias>`            | Sets an alias for the joined table name, in case it clashes with another table.
 `primary=yes`               | Assigns column associated with the field to be sufficient for returning a row from the table. Will default to `Name` if unspecified. Fields with this key will be included in the default 'ORDER BY' clause.
 `omit=<Stmt Types>`         | Omits a given field from consideration for the comma separated list of statement types (`create`, `objects-by-Name`, `update`).
 `ignore`                    | Outright ignore the struct field as though it does not exist. `ignore` needs to be the only tag value in order to be recognized.
@@ -194,6 +195,11 @@ including a comma separated list to `references=<OtherEntity>` in the code gener
 
 A struct that contains a field named `ReferenceID` will be parsed this way.
 `generate-database` will use this struct to generate more abstract SQL statements and functions of the form `<parent_table>_<this_table>`.
+
+The associated `Filter` struct may include a `ReferenceID []int` field.
+This generates an `IN` clause matching on the parent column, with the integer values inlined into the query to avoid query parameter count limits.
+A nil slice leaves the filter unset while an empty (non-nil) slice matches nothing.
+When the field is present, the generated per-parent helpers and nested reference fetches are automatically scoped to the relevant parent IDs rather than fetching the whole table.
 
 Real world invocation of these statements and functions should be done through an `EntityTable` `method` call with the tag `references=<ThisStruct>`. This `EntityTable` will replace the `<parent_table>` above.
 

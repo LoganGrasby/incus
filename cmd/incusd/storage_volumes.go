@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 
 	"github.com/lxc/incus/v7/internal/filter"
@@ -156,8 +155,14 @@ var storagePoolVolumeTypeFileCmd = APIEndpoint{
 //                "/1.0/storage-pools/local/volumes/custom/backups",
 //                "/1.0/storage-pools/local/volumes/custom/images"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -215,8 +220,14 @@ var storagePoolVolumeTypeFileCmd = APIEndpoint{
 //            description: List of storage volumes
 //            items:
 //              $ref: "#/definitions/StorageVolume"
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -279,8 +290,14 @@ var storagePoolVolumeTypeFileCmd = APIEndpoint{
 //                "/1.0/storage-pools/local/volumes/custom/backups",
 //                "/1.0/storage-pools/local/volumes/custom/images"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -338,8 +355,14 @@ var storagePoolVolumeTypeFileCmd = APIEndpoint{
 //	          description: List of storage volumes
 //	          items:
 //	            $ref: "#/definitions/StorageVolume"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 
@@ -397,8 +420,14 @@ var storagePoolVolumeTypeFileCmd = APIEndpoint{
 //	          description: List of storage volumes
 //	          items:
 //	            $ref: "#/definitions/StorageVolumeFull"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumesGet(d *Daemon, r *http.Request) response.Response {
@@ -412,13 +441,13 @@ func storagePoolVolumesGet(d *Daemon, r *http.Request) response.Response {
 	targetMember := request.QueryParam(r, "target")
 	memberSpecific := targetMember != ""
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the volume type.
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -754,6 +783,10 @@ func filterVolumes(volumes []*db.StorageVolume, clauses *filter.ClauseSet, allPr
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 
@@ -805,12 +838,16 @@ func filterVolumes(volumes []*db.StorageVolume, clauses *filter.ClauseSet, allPr
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumesPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -859,9 +896,8 @@ func storagePoolVolumesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Handle being called through the typed URL.
-	_, ok := mux.Vars(r)["type"]
-	if ok {
-		req.Type, err = url.PathUnescape(mux.Vars(r)["type"])
+	if r.PathValue("type") != "" {
+		req.Type, err = pathVar(r, "type")
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -936,6 +972,25 @@ func storagePoolVolumesPost(d *Daemon, r *http.Request) response.Response {
 
 		return doVolumeCreateOrCopy(s, r, request.ProjectParam(r), projectName, poolName, &req)
 	case "copy":
+		// Check that the caller is allowed to view the source volume.
+		srcProjectName := projectName
+		if req.Source.Project != "" {
+			srcProjectName, err = project.StorageVolumeProject(s.DB.Cluster, req.Source.Project, db.StoragePoolVolumeTypeCustom)
+			if err != nil {
+				return response.SmartError(err)
+			}
+		}
+
+		srcPoolName := req.Source.Pool
+		if srcPoolName == "" {
+			srcPoolName = poolName
+		}
+
+		err = s.Authorizer.CheckPermission(r.Context(), r, auth.ObjectStorageVolume(srcProjectName, srcPoolName, db.StoragePoolVolumeTypeNameCustom, req.Source.Name, req.Source.Location), auth.EntitlementCanView)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
 		if dbVolume != nil {
 			return doCustomVolumeRefresh(s, r, request.ProjectParam(r), projectName, poolName, &req)
 		}
@@ -1235,24 +1290,30 @@ func doVolumeMigration(s *state.State, r *http.Request, requestProjectName strin
 //	    schema:
 //	      $ref: "#/definitions/StorageVolumePost"
 //	responses:
+//	  "201":
+//	    $ref: "#/responses/EmptySyncResponse"
 //	  "202":
 //	    $ref: "#/responses/Operation"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumePost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -1262,7 +1323,7 @@ func storagePoolVolumePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	srcPoolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	srcPoolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -1913,8 +1974,14 @@ func storagePoolVolumeTypePostMove(s *state.State, r *http.Request, poolName str
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/StorageVolume"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 
@@ -1974,26 +2041,32 @@ func storagePoolVolumeTypePostMove(s *state.State, r *http.Request, poolName str
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/StorageVolumeFull"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumeGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2224,6 +2297,10 @@ func getVolumeFull(ctx context.Context, s *state.State, poolName string, vol api
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -2232,19 +2309,19 @@ func storagePoolVolumePut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2413,6 +2490,10 @@ func storagePoolVolumePut(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -2421,12 +2502,12 @@ func storagePoolVolumePatch(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2436,7 +2517,7 @@ func storagePoolVolumePatch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2562,18 +2643,22 @@ func storagePoolVolumePatch(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumeDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2583,7 +2668,7 @@ func storagePoolVolumeDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2685,6 +2770,12 @@ func createStoragePoolVolumeFromISO(s *state.State, r *http.Request, requestProj
 		return response.BadRequest(errors.New("Missing volume name"))
 	}
 
+	// Validate the volume name to avoid path traversal when used as a path segment.
+	err := validate.IsAPIName(volName, false)
+	if err != nil {
+		return response.BadRequest(fmt.Errorf("Invalid volume name: %w", err))
+	}
+
 	// Create isos directory if needed.
 	if !util.PathExists(internalUtil.VarPath("isos")) {
 		err := os.MkdirAll(internalUtil.VarPath("isos"), 0o644)
@@ -2699,7 +2790,7 @@ func createStoragePoolVolumeFromISO(s *state.State, r *http.Request, requestProj
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = os.Remove(isoFile.Name()) }()
+	defer logger.WarnOnError(func() error { return os.Remove(isoFile.Name()) }, "Failed to remove ISO file")
 	reverter.Add(func() { _ = isoFile.Close() })
 
 	// Get disk budget for the project if any.
@@ -2727,7 +2818,7 @@ func createStoragePoolVolumeFromISO(s *state.State, r *http.Request, requestProj
 	runReverter := reverter.Clone()
 
 	run := func(op *operations.Operation) error {
-		defer func() { _ = isoFile.Close() }()
+		defer logger.WarnOnError(isoFile.Close, "Failed to close ISO file")
 		defer runReverter.Fail()
 
 		pool, err := storagePools.LoadByName(s, pool)
@@ -2767,7 +2858,7 @@ func createStoragePoolVolumeFromBackup(s *state.State, r *http.Request, requestP
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = os.Remove(backupFile.Name()) }()
+	defer logger.WarnOnError(func() error { return os.Remove(backupFile.Name()) }, "Failed to remove backup file")
 	reverter.Add(func() { _ = backupFile.Close() })
 
 	// Get disk budget for the project if any.
@@ -2812,7 +2903,7 @@ func createStoragePoolVolumeFromBackup(s *state.State, r *http.Request, requestP
 			return response.InternalError(err)
 		}
 
-		defer func() { _ = os.Remove(tarFile.Name()) }()
+		defer logger.WarnOnError(func() error { return os.Remove(tarFile.Name()) }, "Failed to remove tarball file")
 
 		// Decompress to tarFile temporary file.
 		err = archive.ExtractWithFds(decomArgs[0], decomArgs[1:], nil, nil, tarFile)
@@ -2850,6 +2941,19 @@ func createStoragePoolVolumeFromBackup(s *state.State, r *http.Request, requestP
 	// Override volume name.
 	if volName != "" {
 		bInfo.Name = volName
+	}
+
+	// Validate the volume and snapshot names to avoid path traversal when used as path segments.
+	err = validate.IsAPIName(bInfo.Name, false)
+	if err != nil {
+		return response.BadRequest(fmt.Errorf("Invalid volume name: %w", err))
+	}
+
+	for _, snapName := range bInfo.Snapshots {
+		err = validate.IsAPIName(snapName, false)
+		if err != nil {
+			return response.BadRequest(fmt.Errorf("Invalid snapshot name: %w", err))
+		}
 	}
 
 	logger.Debug("Backup file info loaded", logger.Ctx{
@@ -2903,7 +3007,7 @@ func createStoragePoolVolumeFromBackup(s *state.State, r *http.Request, requestP
 	runReverter := reverter.Clone()
 
 	run := func(op *operations.Operation) error {
-		defer func() { _ = backupFile.Close() }()
+		defer logger.WarnOnError(backupFile.Close, "Failed to close backup file")
 		defer runReverter.Fail()
 
 		pool, err := storagePools.LoadByName(s, bInfo.Pool)

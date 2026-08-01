@@ -4,10 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
-
-	"github.com/gorilla/mux"
 
 	"github.com/lxc/incus/v7/internal/server/lifecycle"
 	"github.com/lxc/incus/v7/internal/server/project"
@@ -23,19 +20,19 @@ import (
 func storagePoolVolumeTypeFileHandler(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
-	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	volumeTypeName, err := pathVar(r, "type")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage volume.
-	volumeName, err := url.PathUnescape(mux.Vars(r)["volumeName"])
+	volumeName, err := pathVar(r, "volumeName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage pool the volume is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -182,6 +179,8 @@ func storagePoolVolumeTypeFileHandler(d *Daemon, r *http.Request) response.Respo
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storageVolumeFileGet(s *state.State, vol storageDrivers.Volume, volumeProjectName string, path string, r *http.Request) response.Response {
@@ -263,6 +262,8 @@ func storageVolumeFileGet(s *state.State, vol storageDrivers.Volume, volumeProje
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storageVolumeFileHead(s *state.State, vol storageDrivers.Volume, volumeProjectName string, path string, _ *http.Request) response.Response {
@@ -358,6 +359,8 @@ func storageVolumeFileHead(s *state.State, vol storageDrivers.Volume, volumeProj
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storageVolumeFilePost(s *state.State, vol storageDrivers.Volume, volumeProjectName string, path string, r *http.Request) response.Response {
@@ -366,7 +369,7 @@ func storageVolumeFilePost(s *state.State, vol storageDrivers.Volume, volumeProj
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = client.Close() }()
+	defer logger.WarnOnError(client.Close, "Failed to close SFTP client")
 
 	return fileSFTPPost(client, path, r, func() {
 		s.Events.SendLifecycle(volumeProjectName, lifecycle.StorageVolumeFilePushed.Event(vol, string(vol.Type()), volumeProjectName, nil, logger.Ctx{"path": path}))
@@ -423,6 +426,8 @@ func storageVolumeFilePost(s *state.State, vol storageDrivers.Volume, volumeProj
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storageVolumeFileDelete(s *state.State, vol storageDrivers.Volume, volumeProjectName string, path string, r *http.Request) response.Response {
@@ -431,7 +436,7 @@ func storageVolumeFileDelete(s *state.State, vol storageDrivers.Volume, volumePr
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = client.Close() }()
+	defer logger.WarnOnError(client.Close, "Failed to close SFTP client")
 
 	return fileSFTPDelete(client, path, r, func() {
 		s.Events.SendLifecycle(volumeProjectName, lifecycle.StorageVolumeFileDeleted.Event(vol, string(vol.Type()), volumeProjectName, nil, logger.Ctx{"path": path}))

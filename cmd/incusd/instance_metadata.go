@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/gorilla/mux"
 	"go.yaml.in/yaml/v4"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
@@ -68,15 +67,21 @@ import (
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/ImageMetadata"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -112,21 +117,27 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, c, nil) }, "Failed to unmount instance")
 
-	// If missing, just return empty result
-	metadataPath := filepath.Join(c.Path(), "metadata.yaml")
-	if !util.PathExists(metadataPath) {
-		return response.SyncResponse(true, api.ImageMetadata{})
+	// Confine metadata access to the instance directory.
+	root, err := os.OpenRoot(c.Path())
+	if err != nil {
+		return response.SmartError(err)
 	}
 
-	// Read the metadata
-	metadataFile, err := os.Open(metadataPath)
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
+
+	// Read the metadata (if missing, just return empty result).
+	metadataFile, err := root.Open("metadata.yaml")
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return response.SyncResponse(true, api.ImageMetadata{})
+		}
+
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = metadataFile.Close() }()
+	defer logger.WarnOnError(metadataFile.Close, "Failed to close metadata file")
 
 	data, err := io.ReadAll(metadataFile)
 	if err != nil {
@@ -180,6 +191,10 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -188,7 +203,7 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -224,18 +239,25 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, inst, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, inst, nil) }, "Failed to unmount instance")
+
+	// Confine metadata access to the instance directory.
+	root, err := os.OpenRoot(inst.Path())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
 
 	// Read the existing data.
-	metadataPath := filepath.Join(inst.Path(), "metadata.yaml")
 	metadata := api.ImageMetadata{}
-	if util.PathExists(metadataPath) {
-		metadataFile, err := os.Open(metadataPath)
-		if err != nil {
-			return response.InternalError(err)
-		}
+	metadataFile, err := root.Open("metadata.yaml")
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return response.InternalError(err)
+	}
 
-		defer func() { _ = metadataFile.Close() }()
+	if err == nil {
+		defer logger.WarnOnError(metadataFile.Close, "Failed to close metadata file")
 
 		data, err := io.ReadAll(metadataFile)
 		if err != nil {
@@ -300,6 +322,10 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -308,7 +334,7 @@ func instanceMetadataPut(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -351,21 +377,27 @@ func instanceMetadataPut(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, inst, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, inst, nil) }, "Failed to unmount instance")
 
 	return doInstanceMetadataUpdate(s, inst, metadata, r)
 }
 
 func doInstanceMetadataUpdate(s *state.State, inst instance.Instance, metadata api.ImageMetadata, r *http.Request) response.Response {
 	// Convert YAML.
-	data, err := yaml.Dump(metadata, yaml.V2)
+	data, err := yaml.Dump(metadata, yaml.WithV2Defaults())
 	if err != nil {
 		return response.BadRequest(err)
 	}
 
-	// Update the metadata.
-	metadataPath := filepath.Join(inst.Path(), "metadata.yaml")
-	err = os.WriteFile(metadataPath, data, 0o644)
+	// Update the metadata (confined to the instance directory).
+	root, err := os.OpenRoot(inst.Path())
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
+
+	err = root.WriteFile("metadata.yaml", data, 0o644)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -426,13 +458,15 @@ func doInstanceMetadataUpdate(s *state.State, inst instance.Instance, metadata a
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -468,20 +502,28 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, c, nil) }, "Failed to unmount instance")
+
+	// Confine all template access to the instance directory.
+	root, err := os.OpenRoot(c.Path())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
 
 	// Look at the request
 	templateName := r.FormValue("path")
 	if templateName == "" {
 		templates := []string{}
-		if !util.PathExists(filepath.Join(c.Path(), "templates")) {
-			return response.SyncResponse(true, templates)
-		}
 
 		// List templates
-		templatesPath := filepath.Join(c.Path(), "templates")
-		entries, err := os.ReadDir(templatesPath)
+		entries, err := fs.ReadDir(root.FS(), "templates")
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return response.SyncResponse(true, templates)
+			}
+
 			return response.InternalError(err)
 		}
 
@@ -495,23 +537,23 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	}
 
 	// Check if the template exists
-	templatePath, err := getContainerTemplatePath(c, templateName)
+	templatePath, err := getContainerTemplatePath(templateName)
 	if err != nil {
 		return response.SmartError(err)
-	}
-
-	if !util.PathExists(templatePath) {
-		return response.NotFound(fmt.Errorf("Template %q not found", templateName))
 	}
 
 	// Create a temporary file with the template content (since the container
 	// storage might not be available when the file is read from FileResponse)
-	template, err := os.Open(templatePath)
+	template, err := root.Open(templatePath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return response.NotFound(fmt.Errorf("Template %q not found", templateName))
+		}
+
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = template.Close() }()
+	defer logger.WarnOnError(template.Close, "Failed to close template file")
 
 	tempfile, err := os.CreateTemp("", "incus_template")
 	if err != nil {
@@ -578,13 +620,15 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -620,7 +664,15 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, c, nil) }, "Failed to unmount instance")
+
+	// Confine all template access to the instance directory.
+	root, err := os.OpenRoot(c.Path())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
 
 	// Look at the request
 	templateName := r.FormValue("path")
@@ -628,21 +680,19 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 		return response.BadRequest(errors.New("missing path argument"))
 	}
 
-	if !util.PathExists(filepath.Join(c.Path(), "templates")) {
-		err := os.MkdirAll(filepath.Join(c.Path(), "templates"), 0o711)
-		if err != nil {
-			return response.SmartError(err)
-		}
+	err = root.Mkdir("templates", 0o711)
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return response.SmartError(err)
 	}
 
 	// Check if the template already exists
-	templatePath, err := getContainerTemplatePath(c, templateName)
+	templatePath, err := getContainerTemplatePath(templateName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Write the new template
-	template, err := os.OpenFile(templatePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	template, err := root.OpenFile(templatePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -696,6 +746,8 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Response {
@@ -703,7 +755,7 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 
 	projectName := request.ProjectParam(r)
 
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -739,7 +791,15 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 		return response.SmartError(err)
 	}
 
-	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
+	defer logger.WarnOnError(func() error { return storagePools.InstanceUnmount(pool, c, nil) }, "Failed to unmount instance")
+
+	// Confine all template access to the instance directory.
+	root, err := os.OpenRoot(c.Path())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	defer logger.WarnOnError(root.Close, "Failed to close instance root")
 
 	// Look at the request
 	templateName := r.FormValue("path")
@@ -747,18 +807,18 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 		return response.BadRequest(errors.New("missing path argument"))
 	}
 
-	templatePath, err := getContainerTemplatePath(c, templateName)
+	templatePath, err := getContainerTemplatePath(templateName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	if !util.PathExists(templatePath) {
-		return response.NotFound(fmt.Errorf("Template %q not found", templateName))
-	}
-
 	// Delete the template
-	err = os.Remove(templatePath)
+	err = root.Remove(templatePath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return response.NotFound(fmt.Errorf("Template %q not found", templateName))
+		}
+
 		return response.InternalError(err)
 	}
 
@@ -767,11 +827,11 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 	return response.EmptySyncResponse
 }
 
-// Return the full path of a container template.
-func getContainerTemplatePath(c instance.Instance, filename string) (string, error) {
+// Return the template path relative to the instance root.
+func getContainerTemplatePath(filename string) (string, error) {
 	if strings.Contains(filename, "/") {
 		return "", errors.New("Invalid template filename")
 	}
 
-	return filepath.Join(c.Path(), "templates", filename), nil
+	return filepath.Join("templates", filename), nil
 }

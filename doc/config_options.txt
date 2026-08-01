@@ -139,21 +139,21 @@ For file systems (shared directories or custom volumes), this is one of:
 
 ```{config:option} limits.max devices-disk
 :required: "no"
-:shortdesc: "I/O limit in byte/s or IOPS for both read and write (same as setting both `limits.read` and `limits.write`)"
+:shortdesc: "I/O limit in byte/s and/or IOPS for both read and write (same as setting both `limits.read` and `limits.write`)"
 :type: "string"
 
 ```
 
 ```{config:option} limits.read devices-disk
 :required: "no"
-:shortdesc: "I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) or in IOPS (must be suffixed with `iops`) - see also {ref}`storage-configure-IO`"
+:shortdesc: "I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) and/or in IOPS (must be suffixed with `iops`), comma separated when specifying both - see also {ref}`storage-configure-IO`"
 :type: "string"
 
 ```
 
 ```{config:option} limits.write devices-disk
 :required: "no"
-:shortdesc: "I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) or in IOPS (must be suffixed with `iops`) - see also {ref}`storage-configure-IO`"
+:shortdesc: "I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) and/or in IOPS (must be suffixed with `iops`), comma separated when specifying both - see also {ref}`storage-configure-IO`"
 :type: "string"
 
 ```
@@ -333,6 +333,44 @@ With VMs, this option supports mounting file system disk devices and paths withi
 ```
 
 <!-- config group devices-gpu_mig end -->
+<!-- config group devices-gpu_native_context start -->
+```{config:option} blob.size devices-gpu_native_context
+:default: "2GiB"
+:required: "no"
+:shortdesc: "Size of the host-visible blob memory window for the `virtio-gpu` device"
+:type: "string"
+
+```
+
+```{config:option} id devices-gpu_native_context
+:required: "no"
+:shortdesc: "The DRM card ID of the GPU device"
+:type: "string"
+
+```
+
+```{config:option} pci devices-gpu_native_context
+:required: "no"
+:shortdesc: "The PCI address of the GPU device"
+:type: "string"
+
+```
+
+```{config:option} productid devices-gpu_native_context
+:required: "no"
+:shortdesc: "The product ID of the GPU device"
+:type: "string"
+
+```
+
+```{config:option} vendorid devices-gpu_native_context
+:required: "no"
+:shortdesc: "The vendor ID of the GPU device"
+:type: "string"
+
+```
+
+<!-- config group devices-gpu_native_context end -->
 <!-- config group devices-gpu_physical start -->
 ```{config:option} gid devices-gpu_physical
 :default: "0"
@@ -449,10 +487,26 @@ With VMs, this option supports mounting file system disk devices and paths withi
 
 ```
 
+```{config:option} node_guid devices-infiniband
+:defaultdesc: "kernel assigned"
+:required: "no"
+:shortdesc: "The node GUID to assign to the virtual function (8 bytes of hex separated by colons)"
+:type: "string"
+
+```
+
 ```{config:option} parent devices-infiniband
 :defaultdesc: "kernel assigned"
 :required: "no"
 :shortdesc: "The name of the interface inside the instance"
+:type: "string"
+
+```
+
+```{config:option} port_guid devices-infiniband
+:defaultdesc: "kernel assigned"
+:required: "no"
+:shortdesc: "The port GUID to assign to the virtual function (8 bytes of hex separated by colons)"
 :type: "string"
 
 ```
@@ -508,7 +562,14 @@ With VMs, this option supports mounting file system disk devices and paths withi
 
 ```{config:option} ipv4.address devices-nic_bridged
 :managed: "no"
-:shortdesc: "An IPv4 address to assign to the instance through DHCP (can be `none` to restrict all IPv4 traffic when `security.ipv4_filtering` is set)"
+:shortdesc: "An IPv4 address to assign to the instance through DHCP (can be `none` to restrict all IPv4 traffic when `security.ipv4_filtering` is set, or a CIDR value to statically configure the address inside an OCI container)"
+:type: "string"
+
+```
+
+```{config:option} ipv4.gateway devices-nic_bridged
+:managed: "no"
+:shortdesc: "IPv4 default gateway to statically configure inside an OCI container (`none` to prevent a default gateway from being applied)"
 :type: "string"
 
 ```
@@ -529,7 +590,14 @@ With VMs, this option supports mounting file system disk devices and paths withi
 
 ```{config:option} ipv6.address devices-nic_bridged
 :managed: "no"
-:shortdesc: "An IPv6 address to assign to the instance through DHCP (can be `none` to restrict all IPv6 traffic when `security.ipv6_filtering` is set)"
+:shortdesc: "An IPv6 address to assign to the instance through DHCP (can be `none` to restrict all IPv6 traffic when `security.ipv6_filtering` is set, or a CIDR value to statically configure the address inside an OCI container)"
+:type: "string"
+
+```
+
+```{config:option} ipv6.gateway devices-nic_bridged
+:managed: "no"
+:shortdesc: "IPv6 default gateway to statically configure inside an OCI container (`none` to prevent a default gateway from being applied)"
 :type: "string"
 
 ```
@@ -946,7 +1014,7 @@ With VMs, this option supports mounting file system disk devices and paths withi
 
 ```{config:option} ipv4.address devices-nic_ovn
 :managed: "no"
-:shortdesc: "An IPv4 address to assign to the instance through DHCP, `none` can be used to disable IP allocation"
+:shortdesc: "An IPv4 address to assign to the instance through DHCP, `none` can be used to disable IP allocation (or a CIDR value to statically configure the address inside an OCI container)"
 :type: "string"
 
 ```
@@ -954,6 +1022,13 @@ With VMs, this option supports mounting file system disk devices and paths withi
 ```{config:option} ipv4.address.external devices-nic_ovn
 :managed: "no"
 :shortdesc: "Select a specific external address (typically from a network forward)"
+:type: "string"
+
+```
+
+```{config:option} ipv4.gateway devices-nic_ovn
+:managed: "no"
+:shortdesc: "IPv4 default gateway to statically configure inside an OCI container (`none` to prevent a default gateway from being applied)"
 :type: "string"
 
 ```
@@ -974,7 +1049,7 @@ With VMs, this option supports mounting file system disk devices and paths withi
 
 ```{config:option} ipv6.address devices-nic_ovn
 :managed: "no"
-:shortdesc: "An IPv6 address to assign to the instance through DHCP, `none` can be used to disable IP allocation"
+:shortdesc: "An IPv6 address to assign to the instance through DHCP, `none` can be used to disable IP allocation (or a CIDR value to statically configure the address inside an OCI container)"
 :type: "string"
 
 ```
@@ -982,6 +1057,13 @@ With VMs, this option supports mounting file system disk devices and paths withi
 ```{config:option} ipv6.address.external devices-nic_ovn
 :managed: "no"
 :shortdesc: "Select a specific external address (typically from a network forward)"
+:type: "string"
+
+```
+
+```{config:option} ipv6.gateway devices-nic_ovn
+:managed: "no"
+:shortdesc: "IPv6 default gateway to statically configure inside an OCI container (`none` to prevent a default gateway from being applied)"
 :type: "string"
 
 ```
@@ -1657,7 +1739,7 @@ The custom policy routing table ID to add IPv6 static routes to (in addition to 
 ```{config:option} nat devices-proxy
 :default: "`false`"
 :required: "no"
-:shortdesc: "Whether to optimize proxying via NAT (requires that the instance NIC has a static IP address)"
+:shortdesc: "Whether to optimize proxying via NAT"
 :type: "bool"
 
 ```
@@ -1718,6 +1800,18 @@ The custom policy routing table ID to add IPv6 static routes to (in addition to 
 :default: "0"
 :shortdesc: "GID of the device owner in the instance"
 :type: "int"
+
+```
+
+```{config:option} limits.read devices-unix-char-block
+:shortdesc: "I/O limit in byte/s and/or IOPS (comma separated) for read operations"
+:type: "string"
+
+```
+
+```{config:option} limits.write devices-unix-char-block
+:shortdesc: "I/O limit in byte/s and/or IOPS (comma separated) for write operations"
+:type: "string"
 
 ```
 
@@ -2205,15 +2299,39 @@ The specified version expression is used to set `libnvidia-container NVIDIA_REQU
 ```{config:option} oci.cwd instance-oci
 :condition: "OCI container"
 :liveupdate: "no"
-:shortdesc: "OCI container working directory"
+:shortdesc: "Working directory"
 :type: "string"
 Override the working directory of an OCI container.
+```
+
+```{config:option} oci.dns.domain instance-oci
+:condition: "OCI container"
+:liveupdate: "no"
+:shortdesc: "DNS domain"
+:type: "string"
+Domain name for the initial `resolv.conf`.
+```
+
+```{config:option} oci.dns.nameservers instance-oci
+:condition: "OCI container"
+:liveupdate: "no"
+:shortdesc: "DNS name servers"
+:type: "string"
+Comma-separated list of name server addresses for the initial `resolv.conf`.
+```
+
+```{config:option} oci.dns.search instance-oci
+:condition: "OCI container"
+:liveupdate: "no"
+:shortdesc: "DNS search domains"
+:type: "string"
+Comma-separated list of search domains for the initial `resolv.conf`.
 ```
 
 ```{config:option} oci.entrypoint instance-oci
 :condition: "OCI container"
 :liveupdate: "no"
-:shortdesc: "OCI container entry point"
+:shortdesc: "Entry point"
 :type: "string"
 Override the entry point of an OCI container.
 ```
@@ -2221,7 +2339,7 @@ Override the entry point of an OCI container.
 ```{config:option} oci.gid instance-oci
 :condition: "OCI container"
 :liveupdate: "no"
-:shortdesc: "OCI container GID"
+:shortdesc: "Process GID"
 :type: "string"
 Override the GID of the process run in an OCI container.
 ```
@@ -2229,7 +2347,7 @@ Override the GID of the process run in an OCI container.
 ```{config:option} oci.uid instance-oci
 :condition: "OCI container"
 :liveupdate: "no"
-:shortdesc: "OCI container UID"
+:shortdesc: "Process UID"
 :type: "string"
 Override the UID of the process run in an OCI container.
 ```
@@ -2477,6 +2595,8 @@ The default value of 0 means no adjustment to the Out Of Memory score.
 When set to `true` or `false`, it controls whether the container is likely to get some of
 its memory swapped by the kernel. Alternatively, it can be set to a bytes value which will
 then allow the container to make use of additional memory through swap.
+
+Support for this is limited on cgroup2 systems due to lack of swap priority control.
 ```
 
 ```{config:option} limits.memory.swap.priority instance-resource-limits
@@ -2487,6 +2607,8 @@ then allow the container to make use of additional memory through swap.
 :type: "integer"
 Specify an integer between 0 and 10.
 The higher the value, the less likely the instance is to be swapped to disk.
+
+This currently doesn't have any effect on cgroup2 systems.
 ```
 
 ```{config:option} limits.processes instance-resource-limits
@@ -2618,12 +2740,12 @@ If specified, the idmap used for this instance is unique among instances that ha
 ```
 
 ```{config:option} security.nesting instance-security
-:condition: "container"
-:defaultdesc: "`false`"
-:liveupdate: "yes"
-:shortdesc: "Whether to support running Incus (nested) inside the instance"
+:defaultdesc: "`false` (containers), `true` (VMs)"
+:liveupdate: "yes (containers only)"
+:shortdesc: "Whether to allow nesting inside of the instance"
 :type: "bool"
-
+For containers, this controls whether Incus (nested) can be run inside of the instance.
+For virtual machines, setting this to `false` disables nested virtualization (turns off the `svm` and `vmx` CPU flags).
 ```
 
 ```{config:option} security.privileged instance-security
@@ -2659,6 +2781,50 @@ Set this option to `true` to prevent the instance's file system from being UID/G
 :shortdesc: "Whether UEFI secure boot is enforced with the default Microsoft keys"
 :type: "bool"
 When disabling this option, consider enabling {config:option}`instance-security:security.csm`.
+```
+
+```{config:option} security.selinux.domain instance-security
+:condition: "container or virtual machine"
+:defaultdesc: "auto-detected (`container_init_t` for containers, `qemu_t` for VMs)"
+:liveupdate: "no"
+:shortdesc: "SELinux process domain override"
+:type: "string"
+Override the SELinux process domain for the instance.
+```
+
+```{config:option} security.selinux.label_rootfs instance-security
+:condition: "container"
+:defaultdesc: "`auto`"
+:liveupdate: "no"
+:shortdesc: "SELinux rootfs labeling mode (auto, always, never)"
+:type: "string"
+Control SELinux rootfs labeling behavior.
+The default (`auto`) will label rootfs files if it is required. Labeling will be skipped
+only if `security.selinux.level` is explicitly set for the instance, it is not started for
+the first time and the persisted SELinux context is still valid.
+Setting to `always` will label rootfs files on every start and `never` will never touch any
+file labels in the rootfs.
+```
+
+```{config:option} security.selinux.level instance-security
+:condition: "container or virtual machine"
+:defaultdesc: "auto-generated"
+:liveupdate: "no"
+:shortdesc: "SELinux MCS level override"
+:type: "string"
+Override the SELinux MCS level for the instance.
+This key must only be set on individual instances, never on profiles,
+since using the same MCS level across instances breaks isolation.
+Values set via profiles are ignored.
+```
+
+```{config:option} security.selinux.type instance-security
+:condition: "container or virtual machine"
+:defaultdesc: "auto-detected (`container_file_t` for containers, `qemu_image_t` for VMs)"
+:liveupdate: "no"
+:shortdesc: "SELinux file type override"
+:type: "string"
+Override the SELinux file type used for labeling instance storage.
 ```
 
 ```{config:option} security.sev instance-security
@@ -3287,6 +3453,14 @@ User keys can be used in search.
 
 ```
 
+```{config:option} bgp.peers.NAME.interface network_bridge-bgp
+:condition: "BGP server"
+:defaultdesc: "-"
+:shortdesc: "Interface name for BGP unnumbered peering (alternative to the peer address)"
+:type: "string"
+
+```
+
 ```{config:option} bgp.peers.NAME.password network_bridge-bgp
 :condition: "BGP server"
 :defaultdesc: "- (no password)"
@@ -3297,17 +3471,35 @@ User keys can be used in search.
 
 <!-- config group network_bridge-bgp end -->
 <!-- config group network_bridge-common start -->
+```{config:option} bgp.ipv4.instances network_bridge-common
+:condition: "BGP server"
+:default: "`false`"
+:shortdesc: "Whether to advertise a /32 route for the IPv4 address of each running instance"
+:type: "bool"
+
+```
+
 ```{config:option} bgp.ipv4.nexthop network_bridge-common
 :condition: "BGP server"
 :default: "local address"
+:scope: "local"
 :shortdesc: "Override the next-hop for advertised prefixes"
 :type: "string"
+
+```
+
+```{config:option} bgp.ipv6.instances network_bridge-common
+:condition: "BGP server"
+:default: "`false`"
+:shortdesc: "Whether to advertise a /128 route for the IPv6 address of each running instance"
+:type: "bool"
 
 ```
 
 ```{config:option} bgp.ipv6.nexthop network_bridge-common
 :condition: "BGP server"
 :default: "local address"
+:scope: "local"
 :shortdesc: "Override the next-hop for advertised prefixes"
 :type: "string"
 
@@ -3484,7 +3676,7 @@ User keys can be used in search.
 ```{config:option} ipv4.nat.order network_bridge-common
 :condition: "IPv4 address"
 :default: "`before`"
-:shortdesc: "Whether to add the required NAT rules before or after any pre-existing rules"
+:shortdesc: "Whether to add the required NAT rules before or after any pre-existing rules (no effect with the `nftables` firewall driver)"
 :type: "string"
 
 ```
@@ -3580,7 +3772,7 @@ User keys can be used in search.
 ```{config:option} ipv6.nat.order network_bridge-common
 :condition: "IPv6 address"
 :default: "`before`"
-:shortdesc: "Whether to add the required NAT rules before or after any pre-existing rules"
+:shortdesc: "Whether to add the required NAT rules before or after any pre-existing rules (no effect with the `nftables` firewall driver)"
 :type: "string"
 
 ```
@@ -3861,6 +4053,7 @@ User keys can be used in search.
 
 ```{config:option} parent network_macvlan-common
 :condition: "-"
+:scope: "local"
 :shortdesc: "Parent interface to create macvlan NICs on"
 :type: "string"
 
@@ -3882,6 +4075,7 @@ User keys can be used in search.
 <!-- config group network_macvlan-common end -->
 <!-- config group network_ovn-common start -->
 ```{config:option} bridge.external_interfaces network_ovn-common
+:scope: "local"
 :shortdesc: "Comma-separated list of unconfigured network interfaces to include in the bridge"
 :type: "string"
 
@@ -4203,6 +4397,14 @@ User keys can be used in search.
 
 ```
 
+```{config:option} bgp.peers.NAME.interface network_physical-bgp
+:condition: "BGP server"
+:defaultdesc: "-"
+:shortdesc: "Interface name for BGP unnumbered peering (alternative to the peer address)"
+:type: "string"
+
+```
+
 ```{config:option} bgp.peers.NAME.password network_physical-bgp
 :condition: "BGP server"
 :defaultdesc: "- (no password)"
@@ -4230,6 +4432,7 @@ User keys can be used in search.
 
 ```{config:option} parent network_physical-common
 :condition: "-"
+:scope: "local"
 :shortdesc: "Existing interface to use for network"
 :type: "string"
 
@@ -4353,6 +4556,7 @@ User keys can be used in search.
 
 ```{config:option} parent network_sriov-common
 :condition: "-"
+:scope: "local"
 :shortdesc: "Parent interface to create `sriov` NICs on"
 :type: "string"
 
@@ -4588,7 +4792,7 @@ When set to `allow`, {config:option}`instance-security:security.nesting` can be 
 Possible values are `unprivileged`, `isolated`, and `allow`.
 
 - When set to `unprivileged`, this option prevents setting {config:option}`instance-security:security.privileged` to `true`.
-- When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` and {config:option}`instance-security:security.idmap.isolated` to `true`.
+- When set to `isolated`, this option prevents setting {config:option}`instance-security:security.privileged` to `true` and {config:option}`instance-security:security.idmap.isolated` to `false`.
 - When set to `allow`, there is no restriction.
 ```
 
@@ -4755,6 +4959,14 @@ Possible values are `allow` or `block`.
 When set to `allow`, low-level VM options like {config:option}`instance-raw:raw.qemu`, `volatile.*`, etc. can be used.
 ```
 
+```{config:option} restricted.virtual-machines.nesting project-restricted
+:defaultdesc: "`allow`"
+:shortdesc: "Whether to prevent using nested virtualization"
+:type: "string"
+Possible values are `allow` or `block`.
+When set to `block`, {config:option}`instance-security:security.nesting` must be set to `false` on all virtual machines, turning off nested virtualization.
+```
+
 <!-- config group project-restricted end -->
 <!-- config group project-specific start -->
 ```{config:option} backups.compression_algorithm project-specific
@@ -4843,6 +5055,20 @@ Possible values are `DNS-01` and `HTTP-01`.
 
 ```
 
+```{config:option} acme.eab.hmac server-acme
+:scope: "global"
+:shortdesc: "HMAC key for External Account Binding"
+:type: "string"
+
+```
+
+```{config:option} acme.eab.kid server-acme
+:scope: "global"
+:shortdesc: "Key identifier for External Account Binding"
+:type: "string"
+
+```
+
 ```{config:option} acme.email server-acme
 :scope: "global"
 :shortdesc: "Email address used for the account registration"
@@ -4883,6 +5109,85 @@ DNS resolvers to use for performing (recursive) `CNAME` resolving and apex domai
 ```
 
 <!-- config group server-acme end -->
+<!-- config group server-authorization start -->
+```{config:option} authorization.client.default server-authorization
+:scope: "global"
+:shortdesc: "Authorization driver for clients without a more specific class route"
+:type: "string"
+Routes clients that do not match a more specific class to an authorization driver.
+Possible values are `allow`, `deny`, `openfga` and `scriptlet`.
+```
+
+```{config:option} authorization.client.oidc server-authorization
+:scope: "global"
+:shortdesc: "Authorization driver for OIDC-authenticated clients"
+:type: "string"
+Routes OIDC-authenticated clients to an authorization driver.
+Possible values are `allow`, `deny`, `openfga` and `scriptlet`.
+```
+
+```{config:option} authorization.client.tls server-authorization
+:scope: "global"
+:shortdesc: "Authorization driver for unrestricted TLS clients"
+:type: "string"
+Routes clients using an unrestricted client certificate to an authorization driver.
+Possible values are `allow`, `deny`, `openfga` and `scriptlet`.
+```
+
+```{config:option} authorization.client.tls-restricted server-authorization
+:scope: "global"
+:shortdesc: "Authorization driver for restricted TLS clients"
+:type: "string"
+Routes clients using a restricted (project-scoped) client certificate to an authorization driver.
+Possible values are `allow`, `deny`, `tls`, `openfga` and `scriptlet`.
+```
+
+```{config:option} authorization.client.unix server-authorization
+:scope: "global"
+:shortdesc: "Authorization driver for local (`unix` socket) clients"
+:type: "string"
+Routes local clients connecting over the `unix` socket to an authorization driver.
+Possible values are `allow`, `deny`, `openfga` and `scriptlet`.
+```
+
+```{config:option} authorization.openfga.api.token server-authorization
+:scope: "global"
+:shortdesc: "API token of the OpenFGA server"
+:type: "string"
+
+```
+
+```{config:option} authorization.openfga.api.url server-authorization
+:scope: "global"
+:shortdesc: "URL of the OpenFGA server"
+:type: "string"
+
+```
+
+```{config:option} authorization.openfga.store.id server-authorization
+:scope: "global"
+:shortdesc: "ID of the OpenFGA permission store"
+:type: "string"
+
+```
+
+```{config:option} authorization.openfga.tls.identifier server-authorization
+:defaultdesc: "`name`"
+:scope: "global"
+:shortdesc: "Certificate attribute used as the OpenFGA user for TLS clients"
+:type: "string"
+When a TLS client is authorized by OpenFGA, this selects the certificate
+attribute used as the OpenFGA user: `fingerprint` or `name`.
+```
+
+```{config:option} authorization.scriptlet server-authorization
+:scope: "global"
+:shortdesc: "Authorization scriptlet"
+:type: "string"
+When using scriptlet-based authorization, this option stores the scriptlet.
+```
+
+<!-- config group server-authorization end -->
 <!-- config group server-cluster start -->
 ```{config:option} cluster.healing_threshold server-cluster
 :defaultdesc: "`0`"
@@ -5044,6 +5349,13 @@ If enabled, the `Access-Control-Allow-Credentials` HTTP header value is set to `
 ```{config:option} core.https_allowed_origin server-core
 :scope: "global"
 :shortdesc: "`Access-Control-Allow-Origin` HTTP header value"
+:type: "string"
+
+```
+
+```{config:option} core.https_allowed_websocket_origin server-core
+:scope: "global"
+:shortdesc: "Allowed `Origin` values for WebSocket connections"
 :type: "string"
 
 ```
@@ -5343,13 +5655,6 @@ The events can be any combination of `lifecycle`, `logging`, and `network-acl`.
 
 <!-- config group server-loki end -->
 <!-- config group server-miscellaneous start -->
-```{config:option} authorization.scriptlet server-miscellaneous
-:scope: "global"
-:shortdesc: "Authorization scriptlet"
-:type: "string"
-When using scriptlet-based authorization, this option stores the scriptlet.
-```
-
 ```{config:option} backups.compression_algorithm server-miscellaneous
 :defaultdesc: "`gzip`"
 :scope: "global"
@@ -5565,29 +5870,6 @@ Note that the claim must be contained in the access token.
 ```
 
 <!-- config group server-oidc end -->
-<!-- config group server-openfga start -->
-```{config:option} openfga.api.token server-openfga
-:scope: "global"
-:shortdesc: "API token of the OpenFGA server"
-:type: "string"
-
-```
-
-```{config:option} openfga.api.url server-openfga
-:scope: "global"
-:shortdesc: "URL of the OpenFGA server"
-:type: "string"
-
-```
-
-```{config:option} openfga.store.id server-openfga
-:scope: "global"
-:shortdesc: "ID of the OpenFGA permission store"
-:type: "string"
-
-```
-
-<!-- config group server-openfga end -->
 <!-- config group storage_btrfs-common start -->
 ```{config:option} btrfs.create_options storage_btrfs-common
 :default: "-"
@@ -6162,6 +6444,14 @@ Note that the claim must be contained in the access token.
 
 <!-- config group storage_truenas-common end -->
 <!-- config group storage_volume_btrfs-common start -->
+```{config:option} btrfs.compression storage_volume_btrfs-common
+:condition: "appropriate driver"
+:default: "same as `volume.btrfs.compression`"
+:shortdesc: "Compression algorithm to set on the volume, mapping to the Btrfs `compression` property (for example `zstd`, `lzo`, `zlib` or `none`)"
+:type: "string"
+
+```
+
 ```{config:option} initial.gid storage_volume_btrfs-common
 :condition: "custom volume with content type `filesystem`"
 :default: "same as `volume.initial.gid` or `0`"

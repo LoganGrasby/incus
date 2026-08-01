@@ -7,8 +7,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/gorilla/mux"
-
 	"github.com/lxc/incus/v7/internal/version"
 )
 
@@ -170,7 +168,7 @@ func NewObject(objectType ObjectType, projectName string, identifierElements ...
 // Mux vars must be provided in the order that they are found in the endpoint path. If the object
 // requires a project name, this is taken from the project query parameter unless the URL begins
 // with /1.0/projects.
-func ObjectFromRequest(r *http.Request, objectType ObjectType, expandProject func(string) string, expandFingerprint func(string, string) string, expandVolumeLocation func(string, string, string, string) string, muxVars ...string) (Object, error) {
+func ObjectFromRequest(r *http.Request, objectType ObjectType, expandProject func(string) string, expandFingerprint func(string, string) string, expandVolumeLocation func(string, string, string, string) string, expandBucketLocation func(string, string, string) string, muxVars ...string) (Object, error) {
 	// Shortcut for server objects which don't require any arguments.
 	if objectType == ObjectTypeServer {
 		return ObjectServer(), nil
@@ -191,28 +189,25 @@ func ObjectFromRequest(r *http.Request, objectType ObjectType, expandProject fun
 	location := values.Get("target")
 
 	muxValues := make([]string, 0, len(muxVars))
-	vars := mux.Vars(r)
 	for _, muxVar := range muxVars {
-		var err error
 		var muxValue string
 
 		if muxVar == "location" {
-			// Special handling for the location which is not present as a real mux var.
+			// Special handling for the location which is not present as a real path variable.
 			if location != "" {
 				muxValue = location
 			} else if objectType == ObjectTypeStorageVolume {
-				muxValue = expandVolumeLocation(projectName, vars["poolName"], vars["type"], vars["volumeName"])
+				muxValue = expandVolumeLocation(projectName, r.PathValue("poolName"), r.PathValue("type"), r.PathValue("volumeName"))
+			} else if objectType == ObjectTypeStorageBucket {
+				muxValue = expandBucketLocation(projectName, r.PathValue("poolName"), r.PathValue("bucketName"))
 			}
 
 			if muxValue == "" {
 				continue
 			}
 		} else {
-			muxValue, err = url.PathUnescape(vars[muxVar])
-			if err != nil {
-				return "", fmt.Errorf("Failed to unescape mux var %q for object type %q: %w", muxVar, objectType, err)
-			}
-
+			// The HTTP router already URL-decodes path segments.
+			muxValue = r.PathValue(muxVar)
 			if muxValue == "" {
 				return "", fmt.Errorf("Mux var %q not found for object type %q", muxVar, objectType)
 			}

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,9 +15,11 @@ import (
 	"github.com/lxc/incus/v7/internal/linux"
 	"github.com/lxc/incus/v7/internal/server/db"
 	dbCluster "github.com/lxc/incus/v7/internal/server/db/cluster"
+	"github.com/lxc/incus/v7/internal/server/instance/drivers/cfg"
 	"github.com/lxc/incus/v7/internal/server/instance/drivers/qemudefault"
 	"github.com/lxc/incus/v7/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v7/shared/osarch"
+	"github.com/lxc/incus/v7/shared/osinfo"
 	"github.com/lxc/incus/v7/shared/resources"
 	"github.com/lxc/incus/v7/shared/units"
 	"github.com/lxc/incus/v7/shared/util"
@@ -28,8 +32,8 @@ type qemuCPUTopology struct {
 	Threads  int  `json:"threads"`
 	Explicit bool `json:"explicit"`
 
-	vCPUs map[uint64]uint64
-	nodes map[uint64][]uint64
+	VCPUs map[uint64]uint64   `json:"vcpus,omitempty"`
+	Nodes map[uint64][]uint64 `json:"nodes,omitempty"`
 }
 
 // cpuTopology sets up the qemuCPUTopology struct based on configured CPU limits, host system and guest OS.
@@ -83,14 +87,17 @@ func (d *qemu) cpuTopology() (*qemuCPUTopology, error) {
 
 	// Match tracking.
 	vcpus := map[uint64]uint64{}
-	sockets := map[uint64][]uint64{}
-	cores := map[uint64][]uint64{}
+	sockets := map[uint64][]string{}
+	cores := map[string][]uint64{}
 	numaNodes := map[uint64][]uint64{}
 
 	// Go through the physical CPUs looking for matches.
 	i := uint64(0)
 	for _, cpu := range cpus.Sockets {
 		for _, core := range cpu.Cores {
+			// Core identifiers may only be unique within a cluster.
+			coreKey := fmt.Sprintf("%d_%d", core.Cluster, core.Core)
+
 			for _, thread := range core.Threads {
 				for _, pin := range pins {
 					if thread.ID == int64(pin) {
@@ -100,25 +107,25 @@ func (d *qemu) cpuTopology() (*qemuCPUTopology, error) {
 						// Track cores per socket.
 						_, ok := sockets[cpu.Socket]
 						if !ok {
-							sockets[cpu.Socket] = []uint64{}
+							sockets[cpu.Socket] = []string{}
 						}
 
-						if !slices.Contains(sockets[cpu.Socket], core.Core) {
-							sockets[cpu.Socket] = append(sockets[cpu.Socket], core.Core)
+						if !slices.Contains(sockets[cpu.Socket], coreKey) {
+							sockets[cpu.Socket] = append(sockets[cpu.Socket], coreKey)
 						}
 
 						// Track threads per core.
-						_, ok = cores[core.Core]
+						_, ok = cores[coreKey]
 						if !ok {
-							cores[core.Core] = []uint64{}
+							cores[coreKey] = []uint64{}
 						}
 
-						if !slices.Contains(cores[core.Core], thread.Thread) {
-							cores[core.Core] = append(cores[core.Core], thread.Thread)
+						if !slices.Contains(cores[coreKey], thread.Thread) {
+							cores[coreKey] = append(cores[coreKey], thread.Thread)
 						}
 
 						// Record NUMA node for thread.
-						_, ok = cores[core.Core]
+						_, ok = numaNodes[thread.NUMANode]
 						if !ok {
 							numaNodes[thread.NUMANode] = []uint64{}
 						}
@@ -188,10 +195,116 @@ func (d *qemu) cpuTopology() (*qemuCPUTopology, error) {
 	topology.Sockets = nrSockets
 	topology.Cores = nrCores
 	topology.Threads = nrThreads
-	topology.vCPUs = vcpus
-	topology.nodes = numaNodes
+	topology.VCPUs = vcpus
+	topology.Nodes = numaNodes
 
 	return topology, nil
+}
+
+// startupCPUSet returns the host CPUs to confine QEMU to during startup.
+// On systems with heterogeneous CPU types (ARM big.LITTLE), KVM vCPU initialization
+// fails if the thread gets scheduled across CPU types, so QEMU must start on a
+// single type. Returns nil on homogeneous systems where no confinement is needed.
+func (d *qemu) startupCPUSet(topology *qemuCPUTopology) []int64 {
+	// Get the list of online CPUs.
+	online, err := os.ReadFile("/sys/devices/system/cpu/online")
+	if err != nil {
+		return nil
+	}
+
+	cpuIDs, err := resources.ParseCpuset(strings.TrimSpace(string(online)))
+	if err != nil {
+		return nil
+	}
+
+	// Group the CPUs by type.
+	keys := []string{}
+	groups := map[string][]int64{}
+	for _, id := range cpuIDs {
+		cpuPath := fmt.Sprintf("/sys/devices/system/cpu/cpu%d", id)
+
+		// Only ARM exposes the MIDR register, other architectures don't have the problem.
+		midr, err := os.ReadFile(filepath.Join(cpuPath, "regs/identification/midr_el1"))
+		if err != nil {
+			return nil
+		}
+
+		key := strings.TrimSpace(string(midr))
+
+		// Include the cache geometry as identical parts may still differ.
+		caches, _ := filepath.Glob(filepath.Join(cpuPath, "cache/index[0-9]*"))
+		slices.Sort(caches)
+		for _, cache := range caches {
+			for _, field := range []string{"level", "type", "coherency_line_size", "ways_of_associativity", "number_of_sets"} {
+				value, _ := os.ReadFile(filepath.Join(cache, field))
+				key += "/" + strings.TrimSpace(string(value))
+			}
+		}
+
+		if groups[key] == nil {
+			keys = append(keys, key)
+		}
+
+		groups[key] = append(groups[key], id)
+	}
+
+	// Nothing to do on homogeneous systems.
+	if len(groups) <= 1 {
+		return nil
+	}
+
+	// When pinned, use the largest same-type subset of the pinned CPUs.
+	if topology != nil && topology.VCPUs != nil {
+		pins := map[int64]bool{}
+		for _, pin := range topology.VCPUs {
+			pins[int64(pin)] = true
+		}
+
+		var best []int64
+		for _, key := range keys {
+			matches := []int64{}
+			for _, id := range groups[key] {
+				if pins[id] {
+					matches = append(matches, id)
+				}
+			}
+
+			if len(matches) > len(best) {
+				best = matches
+			}
+		}
+
+		return best
+	}
+
+	// When not pinned, use the CPU type with the highest total compute capacity.
+	var best []int64
+	var bestCapacity int64
+	for _, key := range keys {
+		var capacity int64
+		for _, id := range groups[key] {
+			value, err := os.ReadFile(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/cpu_capacity", id))
+			if err != nil {
+				capacity += 1024
+				continue
+			}
+
+			parsed, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+			if err != nil {
+				capacity += 1024
+				continue
+			}
+
+			capacity += parsed
+		}
+
+		if capacity > bestCapacity {
+			best = groups[key]
+			bestCapacity = capacity
+		}
+	}
+
+	return best
 }
 
 // cpuType generates the QEMU cpu flag based on the CPU topology, guest OS and host system.
@@ -204,6 +317,9 @@ func (d *qemu) cpuType(bs *qemuBootState) (string, error) {
 		if !d.CanLiveMigrate() {
 			// x86_64 can use hv_time to improve Windows guest performance.
 			cpuExtensions = append(cpuExtensions, "hv_passthrough")
+		} else {
+			// Try to emulate hv_passthrough without the migration limitation. Of this set, particularly hv_time has a strong effect on I/O performance.
+			cpuExtensions = append(cpuExtensions, "hv_relaxed", "hv_vpindex", "hv_runtime", "hv_time", "hv_synic", "hv_stimer", "hv_tlbflush", "hv_ipi", "hv_frequencies", "hv_stimer_direct", "hv_xmm_input", "hv_tlbflush_ext")
 		}
 
 		// x86_64 requires the use of topoext when SMT is used.
@@ -277,6 +393,11 @@ func (d *qemu) cpuType(bs *qemuBootState) (string, error) {
 		}
 	}
 
+	// Turn off nested virtualization when security.nesting is disabled.
+	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 && util.IsFalse(d.expandedConfig["security.nesting"]) {
+		cpuExtensions = append(cpuExtensions, "-svm", "-vmx")
+	}
+
 	// Get the feature flags.
 	info := DriverStatuses()[instancetype.VM].Info
 	_, nested := info.Features["nested"]
@@ -285,6 +406,11 @@ func (d *qemu) cpuType(bs *qemuBootState) (string, error) {
 	if !nested && d.architecture == osarch.ARCH_64BIT_INTEL_X86 && !d.CanLiveMigrate() {
 		cpuExtensions = append(cpuExtensions, "migratable=no", "+invtsc")
 	}
+
+	// Some older OSes will kernel panic with SMAP enabled, so explicitly disable it if we detect those versions.
+	osType, distro, version := osinfo.DetermineOSDetails(d.expandedConfig["image.os"], d.expandedConfig["image.release"])
+	_, _, disableFlags := osinfo.GetOSQemuCompatibility(osType, distro, version)
+	cpuExtensions = append(cpuExtensions, disableFlags...)
 
 	if len(cpuExtensions) > 0 {
 		cpuType += "," + strings.Join(cpuExtensions, ",")
@@ -321,7 +447,7 @@ func (d *qemu) memoryTopology(bs *qemuBootState) (*qemuMemoryTopology, error) {
 	limitsMemoryHotplug := d.expandedConfig["limits.memory.hotplug"]
 	memoryHotplugEnabled := !util.IsFalse(limitsMemoryHotplug)
 
-	if d.GuestOS() == "freebsd" {
+	if d.GuestOS() == osinfo.FreeBSD {
 		memoryHotplugEnabled = false
 
 		// We handle the empty value a bit differently here, as FreeBSD doesn’t have memory hotplug.
@@ -395,4 +521,52 @@ func (d *qemu) memoryTopology(bs *qemuBootState) (*qemuMemoryTopology, error) {
 	memInfo.Max = maxMemoryBytes
 
 	return memInfo, nil
+}
+
+func (d *qemu) osVersionSpecificOptions() []cfg.Section {
+	imageOS := d.expandedConfig["image.os"]
+	imageRelease := d.expandedConfig["image.release"]
+
+	osType, distro, version := osinfo.DetermineOSDetails(imageOS, imageRelease)
+
+	supportsVioSCSI, supportsModernVioNet, _ := osinfo.GetOSQemuCompatibility(osType, distro, version)
+
+	var conf []cfg.Section
+	if !supportsModernVioNet {
+		conf = append(conf, cfg.Section{
+			Name: "global",
+			Entries: map[string]string{
+				"driver":   "virtio-net-pci",
+				"property": "disable-legacy",
+				"value":    "off",
+			},
+		})
+	}
+
+	if !supportsVioSCSI {
+		conf = append(conf, cfg.Section{
+			Name: "global",
+			Entries: map[string]string{
+				"driver":   "virtio-blk-pci",
+				"property": "disable-legacy",
+				"value":    "off",
+			},
+		})
+	}
+
+	if osType == osinfo.Windows {
+		versionCode, _ := osinfo.MapWindowsVersionToAbbrev(version)
+		if versionCode == "2k3" || versionCode == "xp" {
+			conf = append(conf, cfg.Section{
+				Name: "global",
+				Entries: map[string]string{
+					"driver":   "q35-pcihost",
+					"property": "x-pci-hole64-fix",
+					"value":    "off",
+				},
+			})
+		}
+	}
+
+	return conf
 }

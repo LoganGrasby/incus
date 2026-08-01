@@ -31,6 +31,7 @@ import (
 	"github.com/lxc/incus/v7/shared/revert"
 	localtls "github.com/lxc/incus/v7/shared/tls"
 	"github.com/lxc/incus/v7/shared/util"
+	"github.com/lxc/incus/v7/shared/ws"
 )
 
 var api10Cmd = APIEndpoint{
@@ -66,6 +67,11 @@ var api10 = []APIEndpoint{
 	instanceMetadataCmd,
 	instanceMetadataTemplatesCmd,
 	instancesCmd,
+	instanceNBDCmd,
+	instanceNVRAMCmd,
+	instanceNVRAMGUIDCmd,
+	instanceNVRAMGUIDVarCmd,
+	instancePortForwardCmd,
 	instanceRebuildCmd,
 	instanceSFTPCmd,
 	instanceSnapshotCmd,
@@ -78,10 +84,7 @@ var api10 = []APIEndpoint{
 	imageAliasCmd,
 	imageAliasesCmd,
 	imageCmd,
-	imageExportCmd,
-	imageRefreshCmd,
 	imagesCmd,
-	imageSecretCmd,
 	metadataConfigurationCmd,
 	networkCmd,
 	networkLeasesCmd,
@@ -180,6 +183,14 @@ var api10 = []APIEndpoint{
 //            example: 200
 //          metadata:
 //            $ref: "#/definitions/ServerUntrusted"
+//    "400":
+//      $ref: "#/responses/BadRequest"
+//    "403":
+//      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -224,6 +235,14 @@ var api10 = []APIEndpoint{
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/Server"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func api10Get(d *Daemon, r *http.Request) response.Response {
@@ -440,6 +459,10 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -536,6 +559,10 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -813,7 +840,9 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	bgpChanged := false
 	dnsChanged := false
 	oidcChanged := false
-	openFGAChanged := false
+	authorizationChanged := false
+	openfgaChanged := false
+	authorizationScriptletChanged := false
 	ovnChanged := false
 	linstorChanged := false
 	ovsChanged := false
@@ -841,6 +870,9 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		case "core.https_trusted_proxy":
 			s.Endpoints.NetworkUpdateTrustedProxy(clusterChanged[key])
 
+		case "core.https_allowed_websocket_origin":
+			ws.SetTrustedOrigins(clusterConf.HTTPSAllowedWebsocketOrigin())
+
 		case "core.proxy_http", "core.proxy_https", "core.proxy_ignore_hosts":
 			daemonConfigSetProxy(d, clusterConf)
 
@@ -859,8 +891,16 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		case "oidc.issuer", "oidc.client.id", "oidc.audience", "oidc.claim", "oidc.scopes":
 			oidcChanged = true
 
-		case "openfga.api.url", "openfga.api.token", "openfga.store.id":
-			openFGAChanged = true
+		case "authorization.openfga.api.url", "authorization.openfga.api.token", "authorization.openfga.store.id", "authorization.openfga.tls.identifier":
+			authorizationChanged = true
+			openfgaChanged = true
+
+		case "authorization.scriptlet":
+			authorizationChanged = true
+			authorizationScriptletChanged = true
+
+		case "authorization.client.default", "authorization.client.unix", "authorization.client.tls", "authorization.client.tls-restricted", "authorization.client.oidc":
+			authorizationChanged = true
 
 		case "storage.linstor.controller_connection", "storage.linstor.ca_cert", "storage.linstor.client_cert", "storage.linstor.client_key":
 			linstorChanged = true
@@ -903,6 +943,15 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		err := s.Endpoints.NetworkUpdateAddress(value)
 		if err != nil {
 			return err
+		}
+
+		// Re-establish the cluster listener in case it was sharing the network listener.
+		clusterAddress := nodeConfig.ClusterAddress()
+		if clusterAddress != "" {
+			err := s.Endpoints.ClusterUpdateAddress(clusterAddress)
+			if err != nil {
+				return err
+			}
 		}
 
 		s.Endpoints.NetworkUpdateTrustedProxy(clusterConf.HTTPSTrustedProxy())
@@ -1014,9 +1063,18 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		}
 	}
 
-	if openFGAChanged {
-		openfgaAPIURL, openfgaAPIToken, openfgaStoreID := d.globalConfig.OpenFGA()
-		err := d.setupOpenFGA(openfgaAPIURL, openfgaAPIToken, openfgaStoreID)
+	if authorizationChanged {
+		// Reload only the optional drivers whose config changed.
+		var reload []string
+		if openfgaChanged {
+			reload = append(reload, auth.DriverOpenFGA)
+		}
+
+		if authorizationScriptletChanged {
+			reload = append(reload, auth.DriverScriptlet)
+		}
+
+		err := d.setupAuthorization(reload...)
 		if err != nil {
 			return err
 		}
@@ -1056,15 +1114,6 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		err := scriptletLoad.InstancePlacementSet(value)
 		if err != nil {
 			return fmt.Errorf("Failed saving instance placement scriptlet: %w", err)
-		}
-	}
-
-	// Setup the authorization scriptlet.
-	value, ok = clusterChanged["authorization.scriptlet"]
-	if ok {
-		err := d.setupAuthorizationScriptlet(value)
-		if err != nil {
-			return err
 		}
 	}
 

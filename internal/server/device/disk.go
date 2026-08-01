@@ -37,6 +37,7 @@ import (
 	"github.com/lxc/incus/v7/shared/idmap"
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/osarch"
+	"github.com/lxc/incus/v7/shared/osinfo"
 	"github.com/lxc/incus/v7/shared/revert"
 	"github.com/lxc/incus/v7/shared/subprocess"
 	"github.com/lxc/incus/v7/shared/units"
@@ -312,7 +313,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 		// ---
 		//  type: string
 		//  required: no
-		//  shortdesc: I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) or in IOPS (must be suffixed with `iops`) - see also {ref}`storage-configure-IO`
+		//  shortdesc: I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) and/or in IOPS (must be suffixed with `iops`), comma separated when specifying both - see also {ref}`storage-configure-IO`
 		"limits.read": validate.IsAny,
 
 		// gendoc:generate(entity=devices, group=disk, key=limits.write)
@@ -320,7 +321,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 		// ---
 		//  type: string
 		//  required: no
-		//  shortdesc: I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) or in IOPS (must be suffixed with `iops`) - see also {ref}`storage-configure-IO`
+		//  shortdesc: I/O limit in byte/s (various suffixes supported, see {ref}`instances-limit-units`) and/or in IOPS (must be suffixed with `iops`), comma separated when specifying both - see also {ref}`storage-configure-IO`
 		"limits.write": validate.IsAny,
 
 		// gendoc:generate(entity=devices, group=disk, key=limits.max)
@@ -328,7 +329,7 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 		// ---
 		//  type: string
 		//  required: no
-		//  shortdesc: I/O limit in byte/s or IOPS for both read and write (same as setting both `limits.read` and `limits.write`)
+		//  shortdesc: I/O limit in byte/s and/or IOPS for both read and write (same as setting both `limits.read` and `limits.write`)
 		"limits.max": validate.IsAny,
 
 		// gendoc:generate(entity=devices, group=disk, key=size)
@@ -515,6 +516,10 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 
 	if d.config["path"] == "/" && d.config["pool"] == "" {
 		return errors.New(`Root disk entry must have a "pool" property set`)
+	}
+
+	if d.config["pool"] != "" && slices.Contains([]string{diskSourceCloudInit, diskSourceAgent}, d.config["source"]) {
+		return fmt.Errorf(`Disk entry with source %q cannot have a "pool" property set`, d.config["source"])
 	}
 
 	if d.config["size"] != "" && d.config["path"] != "/" && d.config["source"] != diskSourceTmpfs && d.config["source"] != diskSourceTmpfsOverlay {
@@ -789,7 +794,8 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 						storagePools.InstanceContentType(d.inst),
 						d.name,
 						initialConfig,
-						d.pool.Driver().Config())
+						d.pool.Driver().Config(),
+					)
 
 					err = d.pool.Driver().ValidateVolume(vol, true)
 					if err != nil {
@@ -1358,7 +1364,7 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 	var diskLimits *deviceConfig.DiskLimits
 	if d.config["limits.read"] != "" || d.config["limits.write"] != "" || d.config["limits.max"] != "" {
 		// Parse the limits into usable values.
-		readBps, readIops, writeBps, writeIops, err := d.parseLimit(d.config)
+		readBps, readIops, writeBps, writeIops, err := diskParseLimits(d.config)
 		if err != nil {
 			return nil, err
 		}
@@ -1475,6 +1481,10 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 				Limits:  diskLimits,
 			}
 
+			if strings.HasSuffix(fields[1], ".iso") {
+				mount.FSType = "iso9660"
+			}
+
 			err := d.setBus(&mount)
 			if err != nil {
 				return nil, err
@@ -1546,8 +1556,17 @@ func (d *disk) startVM() (*deviceConfig.RunConfig, error) {
 						clusterName = storageDrivers.CephDefaultUser
 					}
 
+					driverContentType, err := storagePools.VolumeDBContentTypeToContentType(contentType)
+					if err != nil {
+						return nil, err
+					}
+
+					volStorageName := project.StorageVolume(storageProjectName, volName)
+					vol := d.pool.GetVolume(storageDrivers.VolumeTypeCustom, driverContentType, volStorageName, dbVolume.Config)
+					rbdImageName := storageDrivers.CephGetRBDImageName(vol, "", false)
+
 					mount := deviceConfig.MountEntryItem{
-						DevPath: DiskGetRBDFormat(clusterName, userName, poolName, d.config["source"]),
+						DevPath: DiskGetRBDFormat(clusterName, userName, poolName, rbdImageName),
 						DevName: d.name,
 						Opts:    opts,
 						Limits:  diskLimits,
@@ -1869,28 +1888,22 @@ func (d *disk) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		}
 
 		if d.inst.Type() == instancetype.VM {
-			var diskLimits *deviceConfig.DiskLimits
-			runConf.Mounts = []deviceConfig.MountEntryItem{}
-			if d.config["limits.read"] != "" || d.config["limits.write"] != "" || d.config["limits.max"] != "" {
-				// Parse the limits into usable values.
-				readBps, readIops, writeBps, writeIops, err := d.parseLimit(d.config)
-				if err != nil {
-					return err
-				}
+			// Parse the limits into usable values (zero when unset, which clears any existing throttle).
+			readBps, readIops, writeBps, writeIops, err := diskParseLimits(d.config)
+			if err != nil {
+				return err
+			}
 
-				// Apply the limits to a minimal mount entry.
-				diskLimits = &deviceConfig.DiskLimits{
+			// Always apply the limits so unsetting the config keys resets the throttle.
+			runConf.Mounts = []deviceConfig.MountEntryItem{{
+				DevName: d.name,
+				Limits: &deviceConfig.DiskLimits{
 					ReadBytes:  readBps,
 					ReadIOps:   readIops,
 					WriteBytes: writeBps,
 					WriteIOps:  writeIops,
-				}
-
-				runConf.Mounts = append(runConf.Mounts, deviceConfig.MountEntryItem{
-					DevName: d.name,
-					Limits:  diskLimits,
-				})
-			}
+				},
+			}}
 		}
 
 		err := d.inst.DeviceEventHandler(&runConf)
@@ -2203,7 +2216,7 @@ func (d *disk) createDevice(srcPath string) (func(), string, bool, error) {
 				return nil, "", false, err
 			}
 
-			defer func() { _ = f.Close() }()
+			defer logger.WarnOnError(f.Close, "Failed to close file")
 
 			srcPath = fmt.Sprintf("/proc/self/fd/%d", f.Fd())
 		}
@@ -2233,7 +2246,7 @@ func (d *disk) createDevice(srcPath string) (func(), string, bool, error) {
 				return nil, "", false, fmt.Errorf("Failed opening volume path %q: %w", srcPath, err)
 			}
 
-			defer func() { _ = srcVolPath.Close() }()
+			defer logger.WarnOnError(srcVolPath.Close, "Failed to close volume path")
 
 			openHow := &unix.OpenHow{
 				Flags:   unix.O_PATH | unix.O_CLOEXEC,
@@ -2265,7 +2278,7 @@ func (d *disk) createDevice(srcPath string) (func(), string, bool, error) {
 			}
 
 			srcPathFd := os.NewFile(uintptr(fd), volPath)
-			defer func() { _ = srcPathFd.Close() }()
+			defer logger.WarnOnError(srcPathFd.Close, "Failed to close volume sub-path")
 
 			// Check if the sub-path is a file or a directory.
 			fullSubPath := filepath.Join(srcPath, volPath)
@@ -2397,7 +2410,7 @@ func (d *disk) createVolumeSubPath(volConfig map[string]string, volRootPath stri
 		return fmt.Errorf("Failed opening volume path %q: %w", volRootPath, err)
 	}
 
-	defer func() { _ = volRoot.Close() }()
+	defer logger.WarnOnError(volRoot.Close, "Failed to close volume path")
 
 	var current string
 	for _, component := range strings.Split(volPath, "/") {
@@ -2464,7 +2477,7 @@ func (d *disk) localSourceOpen(srcPath string) (*os.File, error) {
 			return nil, fmt.Errorf("Failed opening allowed parent source path %q: %w", d.restrictedParentSourcePath, err)
 		}
 
-		defer func() { _ = allowedParent.Close() }()
+		defer logger.WarnOnError(allowedParent.Close, "Failed to close allowed parent source path")
 
 		// For restricted source paths we use openat2 to prevent resolving to a mount path above the
 		// allowed parent source path. Requires Linux kernel >= 5.6.
@@ -2817,7 +2830,7 @@ func (d *disk) getDiskLimits() (map[string]diskBlockLimit, error) {
 		}
 
 		// Parse the user input
-		readBps, readIops, writeBps, writeIops, err := d.parseLimit(dev)
+		readBps, readIops, writeBps, writeIops, err := diskParseLimits(dev)
 		if err != nil {
 			return nil, err
 		}
@@ -2929,8 +2942,8 @@ func (d *disk) getDiskLimits() (map[string]diskBlockLimit, error) {
 	return result, nil
 }
 
-// parseLimit parses the disk configuration for its I/O limits and returns the I/O bytes/iops limits.
-func (d *disk) parseLimit(dev deviceConfig.Device) (int64, int64, int64, int64, error) {
+// diskParseLimits parses a device configuration for its I/O limits and returns the I/O bytes/iops limits.
+func diskParseLimits(dev deviceConfig.Device) (int64, int64, int64, int64, error) {
 	readSpeed := dev["limits.read"]
 	writeSpeed := dev["limits.write"]
 
@@ -2940,7 +2953,7 @@ func (d *disk) parseLimit(dev deviceConfig.Device) (int64, int64, int64, int64, 
 		writeSpeed = dev["limits.max"]
 	}
 
-	// parseValue parses a single value to either a B/s limit or iops limit.
+	// parseValue parses a comma separated list of B/s and iops limits.
 	parseValue := func(value string) (int64, int64, error) {
 		var err error
 
@@ -2951,16 +2964,33 @@ func (d *disk) parseLimit(dev deviceConfig.Device) (int64, int64, int64, int64, 
 			return bps, iops, nil
 		}
 
-		before, ok := strings.CutSuffix(value, "iops")
-		if ok {
-			iops, err = strconv.ParseInt(before, 10, 64)
-			if err != nil {
-				return -1, -1, err
-			}
-		} else {
-			bps, err = units.ParseByteSizeString(value)
-			if err != nil {
-				return -1, -1, err
+		hasBps := false
+		hasIops := false
+
+		for _, field := range util.SplitNTrimSpace(value, ",", -1, true) {
+			before, ok := strings.CutSuffix(field, "iops")
+			if ok {
+				if hasIops {
+					return -1, -1, fmt.Errorf("More than one IOPS limit in %q", value)
+				}
+
+				hasIops = true
+
+				iops, err = strconv.ParseInt(before, 10, 64)
+				if err != nil {
+					return -1, -1, err
+				}
+			} else {
+				if hasBps {
+					return -1, -1, fmt.Errorf("More than one byte/s limit in %q", value)
+				}
+
+				hasBps = true
+
+				bps, err = units.ParseByteSizeString(field)
+				if err != nil {
+					return -1, -1, err
+				}
 			}
 		}
 
@@ -3003,7 +3033,7 @@ func (d *disk) getParentBlocks(path string) ([]string, error) {
 		return nil, err
 	}
 
-	defer func() { _ = file.Close() }()
+	defer logger.WarnOnError(file.Close, "Failed to close file")
 
 	scanner := bufio.NewScanner(file)
 	match := ""
@@ -3141,7 +3171,7 @@ func (d *disk) generateVMAgentDrive() (string, error) {
 	defer diskISOGenerateMu.Unlock()
 
 	scratchDir := filepath.Join(d.inst.DevicesPath(), linux.PathNameEncode(d.name))
-	defer func() { _ = os.RemoveAll(scratchDir) }()
+	defer logger.WarnOnError(func() error { return os.RemoveAll(scratchDir) }, "Failed to remove scratch directory")
 
 	// Check we have the mkisofs or genisoimage tool available.
 	var mkisofsPath string
@@ -3173,9 +3203,9 @@ func (d *disk) generateVMAgentDrive() (string, error) {
 		guestOS := d.inst.GuestOS()
 
 		switch guestOS {
-		case "unknown":
-			guestOS = "linux"
-		case "windows":
+		case osinfo.UnknownOS:
+			guestOS = osinfo.Linux
+		case osinfo.Windows:
 			dstFilename = "incus-agent.exe"
 		}
 
@@ -3224,7 +3254,7 @@ func (d *disk) generateVMConfigDrive() (string, error) {
 	defer diskISOGenerateMu.Unlock()
 
 	scratchDir := filepath.Join(d.inst.DevicesPath(), linux.PathNameEncode(d.name))
-	defer func() { _ = os.RemoveAll(scratchDir) }()
+	defer logger.WarnOnError(func() error { return os.RemoveAll(scratchDir) }, "Failed to remove scratch directory")
 
 	// Check we have the mkisofs tool available.
 	mkisofsPath, err := exec.LookPath("mkisofs")
@@ -3335,7 +3365,7 @@ func (d *disk) Remove(cleanupDependencies bool) error {
 			return err
 		}
 
-		defer func() { _ = pool.UnmountInstance(d.inst, nil) }()
+		defer logger.WarnOnError(func() error { return pool.UnmountInstance(d.inst, nil) }, "Failed to unmount instance")
 
 		isoPath := filepath.Join(d.inst.Path(), "config.iso")
 		err = os.Remove(isoPath)

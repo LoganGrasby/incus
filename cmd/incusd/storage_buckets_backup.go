@@ -7,11 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
-
-	"github.com/gorilla/mux"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	"github.com/lxc/incus/v7/internal/jmap"
@@ -113,8 +110,14 @@ var storagePoolBucketBackupsExportCmd = APIEndpoint{
 //                "/1.0/storage-pools/local/buckets/foo/backups/backup0",
 //                "/1.0/storage-pools/local/buckets/foo/backups/backup1"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -172,8 +175,14 @@ var storagePoolBucketBackupsExportCmd = APIEndpoint{
 //	          description: List of storage bucket backups
 //	          items:
 //	            $ref: "#/definitions/StorageBucketBackup"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupsGet(d *Daemon, r *http.Request) response.Response {
@@ -190,13 +199,13 @@ func storagePoolBucketBackupsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the name of the storage bucket.
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the name of the storage pool the bucket is supposed to be attached to.
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -303,6 +312,10 @@ func storagePoolBucketBackupsGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupsPost(d *Daemon, r *http.Request) response.Response {
@@ -318,7 +331,7 @@ func storagePoolBucketBackupsPost(d *Daemon, r *http.Request) response.Response 
 		return response.SmartError(err)
 	}
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -332,7 +345,7 @@ func storagePoolBucketBackupsPost(d *Daemon, r *http.Request) response.Response 
 		return response.BadRequest(errors.New("Storage pool does not support buckets"))
 	}
 
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -550,8 +563,14 @@ func storagePoolBucketBackupsPost(d *Daemon, r *http.Request) response.Response 
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/StorageBucketBackup"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupGet(d *Daemon, r *http.Request) response.Response {
@@ -567,7 +586,7 @@ func storagePoolBucketBackupGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -581,12 +600,12 @@ func storagePoolBucketBackupGet(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(errors.New("Storage pool does not support buckets"))
 	}
 
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
+	backupName, err := pathVar(r, "backupName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -651,6 +670,10 @@ func storagePoolBucketBackupGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupPost(d *Daemon, r *http.Request) response.Response {
@@ -666,7 +689,7 @@ func storagePoolBucketBackupPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -680,12 +703,12 @@ func storagePoolBucketBackupPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(errors.New("Storage pool does not support buckets"))
 	}
 
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
+	backupName, err := pathVar(r, "backupName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -778,6 +801,10 @@ func storagePoolBucketBackupPost(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupDelete(d *Daemon, r *http.Request) response.Response {
@@ -793,7 +820,7 @@ func storagePoolBucketBackupDelete(d *Daemon, r *http.Request) response.Response
 		return response.SmartError(err)
 	}
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -807,12 +834,12 @@ func storagePoolBucketBackupDelete(d *Daemon, r *http.Request) response.Response
 		return response.BadRequest(errors.New("Storage pool does not support buckets"))
 	}
 
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
+	backupName, err := pathVar(r, "backupName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -885,8 +912,14 @@ func storagePoolBucketBackupDelete(d *Daemon, r *http.Request) response.Response
 //	responses:
 //	  "200":
 //	    description: Raw backup data
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolBucketBackupExportGet(d *Daemon, r *http.Request) response.Response {
@@ -902,7 +935,7 @@ func storagePoolBucketBackupExportGet(d *Daemon, r *http.Request) response.Respo
 		return response.SmartError(err)
 	}
 
-	poolName, err := url.PathUnescape(mux.Vars(r)["poolName"])
+	poolName, err := pathVar(r, "poolName")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -916,13 +949,13 @@ func storagePoolBucketBackupExportGet(d *Daemon, r *http.Request) response.Respo
 		return response.BadRequest(errors.New("Storage pool does not support buckets"))
 	}
 
-	bucketName, err := url.PathUnescape(mux.Vars(r)["bucketName"])
+	bucketName, err := pathVar(r, "bucketName")
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get backup name.
-	backupName, err := url.PathUnescape(mux.Vars(r)["backupName"])
+	backupName, err := pathVar(r, "backupName")
 	if err != nil {
 		return response.SmartError(err)
 	}

@@ -5,11 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"slices"
-
-	"github.com/gorilla/mux"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	"github.com/lxc/incus/v7/internal/server/instance"
@@ -22,6 +19,7 @@ import (
 	storagePools "github.com/lxc/incus/v7/internal/server/storage"
 	storageDrivers "github.com/lxc/incus/v7/internal/server/storage/drivers"
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/subprocess"
 	"github.com/lxc/incus/v7/shared/util"
 )
@@ -64,6 +62,8 @@ import (
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceDebugMemoryGet(d *Daemon, r *http.Request) response.Response {
@@ -72,7 +72,7 @@ func instanceDebugMemoryGet(d *Daemon, r *http.Request) response.Response {
 	format := request.QueryParam(r, "format")
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -122,8 +122,8 @@ func instanceDebugMemoryGet(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		defer reader.Close()
-		defer writer.Close()
+		defer logger.WarnOnError(reader.Close, "Failed to close pipe reader")
+		defer logger.WarnOnError(writer.Close, "Failed to close pipe writer")
 
 		chCopy := make(chan error)
 
@@ -147,7 +147,7 @@ func instanceDebugMemoryGet(d *Daemon, r *http.Request) response.Response {
 	})
 }
 
-// swagger:operation GET /1.0/instances/{name}/debug/repair instances instance_debug_repair_post
+// swagger:operation POST /1.0/instances/{name}/debug/repair instances instance_debug_repair_post
 //
 //	Trigger a repair action on the instance.
 //
@@ -180,13 +180,15 @@ func instanceDebugMemoryGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/Forbidden"
 //	  "404":
 //	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instanceDebugRepairPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -214,7 +216,7 @@ func instanceDebugRepairPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Validate the repair action.
-	if !slices.Contains([]string{"rebuild-config-volume"}, req.Action) {
+	if !slices.Contains([]string{"rebuild-config-volume", "rebuild-nvram"}, req.Action) {
 		return response.BadRequest(fmt.Errorf("Invalid repair action %q", req.Action))
 	}
 
@@ -231,6 +233,37 @@ func instanceDebugRepairPost(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return response.SmartError(err)
 		}
+
+	case "rebuild-nvram":
+		return instanceDebugRepairRebuildNVRAM(s, inst)
+	}
+
+	return response.EmptySyncResponse
+}
+
+func instanceDebugRepairRebuildNVRAM(s *state.State, inst instance.Instance) response.Response {
+	// Initial validatoin.
+	if inst.Type() != instancetype.VM {
+		return response.BadRequest(errors.New("NVRAM operations are only supported for virtual machines"))
+	}
+
+	v, ok := inst.(instance.VM)
+	if !ok {
+		return response.InternalError(errors.New("Failed to cast inst to VM"))
+	}
+
+	if inst.IsRunning() {
+		return response.BadRequest(errors.New("UEFI variables cannot be modified on running VMs"))
+	}
+
+	// Actually reset the NVRAM.
+	err := v.ResetNVRAM()
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if err != nil {
+		return response.SmartError(err)
 	}
 
 	return response.EmptySyncResponse

@@ -16,6 +16,7 @@ import (
 	"github.com/lxc/incus/v7/internal/server/instance/instancetype"
 	"github.com/lxc/incus/v7/internal/server/state"
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/osarch"
 )
 
@@ -51,14 +52,14 @@ func ConfigToInstanceDBArgs(s *state.State, c *config.Config, projectName string
 				return err
 			}
 
-			// Get all the profile configs.
-			profileConfigs, err := cluster.GetAllProfileConfigs(ctx, tx.Tx())
+			// Get the profile configs.
+			profileConfigs, err := cluster.GetReferencedProfileConfigs(ctx, tx.Tx(), profiles)
 			if err != nil {
 				return err
 			}
 
-			// Get all the profile devices.
-			profileDevices, err := cluster.GetAllProfileDevices(ctx, tx.Tx())
+			// Get the profile devices.
+			profileDevices, err := cluster.GetReferencedProfileDevices(ctx, tx.Tx(), profiles)
 			if err != nil {
 				return err
 			}
@@ -180,9 +181,9 @@ func UpdateInstanceConfig(c *db.Cluster, b Info, mountPath string) error {
 		return err
 	}
 
-	defer func() { _ = file.Close() }()
+	defer logger.WarnOnError(file.Close, "Failed to close file")
 
-	data, err := yaml.Dump(&backup, yaml.V2)
+	data, err := yaml.Dump(&backup, yaml.WithV2Defaults())
 	if err != nil {
 		return err
 	}

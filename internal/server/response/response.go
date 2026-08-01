@@ -41,11 +41,18 @@ type devIncusResponse struct {
 	content     any
 	code        int
 	contentType string
+	headers     map[string]string
 }
 
 // Render writes the response to the provided http.ResponseWriter.
 func (r *devIncusResponse) Render(w http.ResponseWriter) error {
 	var err error
+
+	if r.headers != nil {
+		for h, v := range r.headers {
+			w.Header().Set(h, v)
+		}
+	}
 
 	if r.code != http.StatusOK {
 		http.Error(w, fmt.Sprintf("%s", r.content), r.code)
@@ -105,6 +112,15 @@ func DevIncusResponse(code int, content any, contentType string, rawResponse boo
 	}
 
 	return &devIncusResponse{content: content, code: code, contentType: contentType}
+}
+
+// DevIncusResponseHeaders returns a new devIncusResponse with headers.
+func DevIncusResponseHeaders(code int, content any, contentType string, rawResponse bool, headers map[string]string) Response {
+	if rawResponse {
+		return SyncResponseHeaders(true, content, headers)
+	}
+
+	return &devIncusResponse{content: content, code: code, contentType: contentType, headers: headers}
 }
 
 // Sync response.
@@ -214,7 +230,7 @@ func (r *syncResponse) Render(w http.ResponseWriter) error {
 		if r.metadata != nil {
 			if r.compress {
 				comp := gzip.NewWriter(w)
-				defer comp.Close()
+				defer logger.WarnOnError(comp.Close, "Failed to close gzip writer")
 
 				_, err := comp.Write([]byte(r.metadata.(string)))
 				if err != nil {
@@ -448,7 +464,7 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 				return err
 			}
 
-			defer func() { _ = f.Close() }()
+			defer logger.WarnOnError(f.Close, "Failed to close file")
 
 			fi, err := f.Stat()
 			if err != nil {
@@ -475,7 +491,7 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 
 	// Now the complex multipart answer.
 	mw := multipart.NewWriter(w)
-	defer func() { _ = mw.Close() }()
+	defer logger.WarnOnError(mw.Close, "Failed to close multipart writer")
 
 	w.Header().Set("Content-Type", mw.FormDataContentType())
 	w.Header().Set("Transfer-Encoding", "chunked")
@@ -491,7 +507,7 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 					return err
 				}
 
-				defer func() { _ = fd.Close() }()
+				defer logger.WarnOnError(fd.Close, "Failed to close file")
 
 				rd = fd
 			}
@@ -654,7 +670,7 @@ func (r *upgradeResponse) Render(w http.ResponseWriter) error {
 		defer r.cleanup()
 	}
 
-	defer func() { _ = r.conn.Close() }()
+	defer logger.WarnOnError(r.conn.Close, "Failed to close connection")
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -666,7 +682,7 @@ func (r *upgradeResponse) Render(w http.ResponseWriter) error {
 		return api.StatusErrorf(http.StatusInternalServerError, "Failed to hijack connection: %v", err)
 	}
 
-	defer func() { _ = remoteConn.Close() }()
+	defer logger.WarnOnError(remoteConn.Close, "Failed to close remote connection")
 
 	remoteTCP, _ := tcp.ExtractConn(remoteConn)
 	if remoteTCP != nil {
@@ -746,7 +762,7 @@ func (r *pipeResponse) Code() int {
 
 // Render writes the response.
 func (r *pipeResponse) Render(w http.ResponseWriter) error {
-	defer func() { _ = r.reader.Close() }()
+	defer logger.WarnOnError(r.reader.Close, "Failed to close reader")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(r.Code())
 
@@ -758,7 +774,14 @@ func (r *pipeResponse) Render(w http.ResponseWriter) error {
 	}
 
 	_, err := util.SafeCopy(w, r.reader)
-	return err
+	if err != nil {
+		// It's too late to send a clean error back to the client, so
+		// instead use the Go HTTP ErrAbortHandler logic to terminate the
+		// connection. This does not cause the daemon itself to panic.
+		panic(http.ErrAbortHandler)
+	}
+
+	return nil
 }
 
 // String returns a quick description of the response.

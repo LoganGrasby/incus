@@ -18,6 +18,24 @@ func IsUserConfig(key string) bool {
 	return strings.HasPrefix(key, "user.")
 }
 
+// isNvidiaConfigValue rejects line breaks that would allow injecting arbitrary directives into the generated LXC configuration.
+func isNvidiaConfigValue(value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return errors.New("NVIDIA configuration values cannot contain line breaks")
+	}
+
+	return nil
+}
+
+// isResolvConfValue rejects line breaks that would allow injecting arbitrary lines into the generated resolv.conf.
+func isResolvConfValue(value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return errors.New("Value cannot contain line breaks")
+	}
+
+	return nil
+}
+
 // ConfigVolatilePrefix indicates the prefix used for volatile config keys.
 const ConfigVolatilePrefix = "volatile."
 
@@ -310,6 +328,16 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  shortdesc: Whether `/dev/incus` is present in the instance
 	"security.guestapi": validate.Optional(validate.IsBool),
 
+	// gendoc:generate(entity=instance, group=security, key=security.nesting)
+	// For containers, this controls whether Incus (nested) can be run inside of the instance.
+	// For virtual machines, setting this to `false` disables nested virtualization (turns off the `svm` and `vmx` CPU flags).
+	// ---
+	//  type: bool
+	//  defaultdesc: `false` (containers), `true` (VMs)
+	//  liveupdate: yes (containers only)
+	//  shortdesc: Whether to allow nesting inside of the instance
+	"security.nesting": validate.Optional(validate.IsBool),
+
 	// gendoc:generate(entity=instance, group=security, key=security.protection.delete)
 	//
 	// ---
@@ -318,6 +346,54 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  liveupdate: yes
 	//  shortdesc: Prevents the instance from being deleted
 	"security.protection.delete": validate.Optional(validate.IsBool),
+
+	// gendoc:generate(entity=instance, group=security, key=security.selinux.type)
+	// Override the SELinux file type used for labeling instance storage.
+	// ---
+	//	type: string
+	//	defaultdesc: auto-detected (`container_file_t` for containers, `qemu_image_t` for VMs)
+	//	liveupdate: no
+	//	condition: container or virtual machine
+	//	shortdesc: SELinux file type override
+	"security.selinux.type": validate.Optional(validate.IsSELinuxType),
+
+	// gendoc:generate(entity=instance, group=security, key=security.selinux.domain)
+	// Override the SELinux process domain for the instance.
+	// ---
+	//	type: string
+	//	defaultdesc: auto-detected (`container_init_t` for containers, `qemu_t` for VMs)
+	//	liveupdate: no
+	//	condition: container or virtual machine
+	//	shortdesc: SELinux process domain override
+	"security.selinux.domain": validate.Optional(validate.IsSELinuxType),
+
+	// gendoc:generate(entity=instance, group=security, key=security.selinux.label_rootfs)
+	// Control SELinux rootfs labeling behavior.
+	// The default (`auto`) will label rootfs files if it is required. Labeling will be skipped
+	// only if `security.selinux.level` is explicitly set for the instance, it is not started for
+	// the first time and the persisted SELinux context is still valid.
+	// Setting to `always` will label rootfs files on every start and `never` will never touch any
+	// file labels in the rootfs.
+	// ---
+	//	type: string
+	//	defaultdesc: `auto`
+	//	liveupdate: no
+	//	condition: container
+	//	shortdesc: SELinux rootfs labeling mode (auto, always, never)
+	"security.selinux.label_rootfs": validate.Optional(validate.IsOneOf("auto", "always", "never")),
+
+	// gendoc:generate(entity=instance, group=security, key=security.selinux.level)
+	// Override the SELinux MCS level for the instance.
+	// This key must only be set on individual instances, never on profiles,
+	// since using the same MCS level across instances breaks isolation.
+	// Values set via profiles are ignored.
+	// ---
+	//	type: string
+	//	defaultdesc: auto-generated
+	//	liveupdate: no
+	//	condition: container or virtual machine
+	//	shortdesc: SELinux MCS level override
+	"security.selinux.level": validate.Optional(validate.IsSELinuxLevel),
 
 	// gendoc:generate(entity=instance, group=snapshots, key=snapshots.schedule)
 	// Specify either a cron expression (`<minute> <hour> <dom> <month> <dow>`), a comma-and-space-separated list of schedule aliases (`@startup`, `@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@annually`, `@yearly`), or leave empty to disable automatic snapshots.
@@ -475,6 +551,12 @@ var InstanceConfigKeysAny = map[string]func(value string) error{
 	//  type: string
 	//  shortdesc: Instance generation UUID
 	"volatile.uuid.generation": validate.Optional(validate.IsUUID),
+
+	// Persisted SELinux context for this instance.
+	// ---
+	//  type: string
+	//  shortdesc: Full SELinux context
+	"volatile.selinux.context": validate.Optional(validate.IsAny),
 }
 
 // InstanceConfigKeysContainer is a map of config key to validator. (keys applying to containers only).
@@ -601,6 +683,8 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	// When set to `true` or `false`, it controls whether the container is likely to get some of
 	// its memory swapped by the kernel. Alternatively, it can be set to a bytes value which will
 	// then allow the container to make use of additional memory through swap.
+	//
+	// Support for this is limited on cgroup2 systems due to lack of swap priority control.
 	// ---
 	//  type: string
 	//  defaultdesc: `true`
@@ -612,6 +696,8 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	// gendoc:generate(entity=instance, group=resource-limits, key=limits.memory.swap.priority)
 	// Specify an integer between 0 and 10.
 	// The higher the value, the less likely the instance is to be swapped to disk.
+	//
+	// This currently doesn't have any effect on cgroup2 systems.
 	// ---
 	//  type: integer
 	//  defaultdesc: `10` (maximum)
@@ -687,7 +773,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  liveupdate: no
 	//  condition: container
 	//  shortdesc: What driver capabilities the instance needs
-	"nvidia.driver.capabilities": validate.IsAny,
+	"nvidia.driver.capabilities": isNvidiaConfigValue,
 
 	// gendoc:generate(entity=instance, group=nvidia, key=nvidia.require.cuda)
 	// The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_CUDA`.
@@ -696,7 +782,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  liveupdate: no
 	//  condition: container
 	//  shortdesc: Required CUDA version
-	"nvidia.require.cuda": validate.IsAny,
+	"nvidia.require.cuda": isNvidiaConfigValue,
 
 	// gendoc:generate(entity=instance, group=nvidia, key=nvidia.require.driver)
 	// The specified version expression is used to set `libnvidia-container NVIDIA_REQUIRE_DRIVER`.
@@ -705,7 +791,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  liveupdate: no
 	//  condition: container
 	//  shortdesc: Required driver version
-	"nvidia.require.driver": validate.IsAny,
+	"nvidia.require.driver": isNvidiaConfigValue,
 
 	// gendoc:generate(entity=instance, group=oci, key=oci.entrypoint)
 	// Override the entry point of an OCI container.
@@ -713,7 +799,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  type: string
 	//  liveupdate: no
 	//  condition: OCI container
-	//  shortdesc: OCI container entry point
+	//  shortdesc: Entry point
 	"oci.entrypoint": validate.IsAny,
 
 	// gendoc:generate(entity=instance, group=oci, key=oci.cwd)
@@ -722,7 +808,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  type: string
 	//  liveupdate: no
 	//  condition: OCI container
-	//  shortdesc: OCI container working directory
+	//  shortdesc: Working directory
 	"oci.cwd": validate.Optional(validate.IsAbsFilePath),
 
 	// gendoc:generate(entity=instance, group=oci, key=oci.gid)
@@ -731,7 +817,7 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  type: string
 	//  liveupdate: no
 	//  condition: OCI container
-	//  shortdesc: OCI container GID
+	//  shortdesc: Process GID
 	"oci.gid": validate.Optional(validate.IsUint32),
 
 	// gendoc:generate(entity=instance, group=oci, key=oci.uid)
@@ -740,8 +826,35 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  type: string
 	//  liveupdate: no
 	//  condition: OCI container
-	//  shortdesc: OCI container UID
+	//  shortdesc: Process UID
 	"oci.uid": validate.Optional(validate.IsUint32),
+
+	// gendoc:generate(entity=instance, group=oci, key=oci.dns.nameservers)
+	// Comma-separated list of name server addresses for the initial `resolv.conf`.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: OCI container
+	//  shortdesc: DNS name servers
+	"oci.dns.nameservers": validate.Optional(validate.IsListOf(validate.IsNetworkAddress)),
+
+	// gendoc:generate(entity=instance, group=oci, key=oci.dns.domain)
+	// Domain name for the initial `resolv.conf`.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: OCI container
+	//  shortdesc: DNS domain
+	"oci.dns.domain": validate.Optional(isResolvConfValue),
+
+	// gendoc:generate(entity=instance, group=oci, key=oci.dns.search)
+	// Comma-separated list of search domains for the initial `resolv.conf`.
+	// ---
+	//  type: string
+	//  liveupdate: no
+	//  condition: OCI container
+	//  shortdesc: DNS search domains
+	"oci.dns.search": validate.Optional(validate.IsListOf(isResolvConfValue)),
 
 	// Caller is responsible for full validation of any raw.* value.
 
@@ -853,16 +966,6 @@ var InstanceConfigKeysContainer = map[string]func(value string) error{
 	//  condition: unprivileged container
 	//  shortdesc: The size of the idmap to use
 	"security.idmap.size": validate.Optional(validate.IsUint32),
-
-	// gendoc:generate(entity=instance, group=security, key=security.nesting)
-	//
-	// ---
-	//  type: bool
-	//  defaultdesc: `false`
-	//  liveupdate: yes
-	//  condition: container
-	//  shortdesc: Whether to support running Incus (nested) inside the instance
-	"security.nesting": validate.Optional(validate.IsBool),
 
 	// gendoc:generate(entity=instance, group=security, key=security.privileged)
 	//

@@ -16,6 +16,7 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/lxc/incus/v7/shared/cancel"
 	"github.com/lxc/incus/v7/shared/ioprogress"
+	"github.com/lxc/incus/v7/shared/logger"
 	localtls "github.com/lxc/incus/v7/shared/tls"
 	"github.com/lxc/incus/v7/shared/units"
 	"github.com/lxc/incus/v7/shared/util"
@@ -432,7 +433,8 @@ func (r *ProtocolIncus) DeleteStoragePoolVolumeSnapshot(pool string, volumeType 
 	// Send the request
 	path := fmt.Sprintf(
 		"/storage-pools/%s/volumes/%s/%s/snapshots/%s",
-		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName), url.PathEscape(snapshotName))
+		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName), url.PathEscape(snapshotName),
+	)
 
 	op, _, err := r.queryOperation("DELETE", path, nil, "")
 	if err != nil {
@@ -1080,7 +1082,7 @@ func (r *ProtocolIncus) GetStorageVolumeBackupFile(pool string, volName string, 
 		return nil, err
 	}
 
-	defer func() { _ = response.Body.Close() }()
+	defer logger.WarnOnError(response.Body.Close, "Failed to close response body")
 	defer close(doneCh)
 
 	if response.StatusCode != http.StatusOK {
@@ -1152,7 +1154,7 @@ func (r *ProtocolIncus) CreateStorageVolumeBackupStream(pool string, volName str
 		return err
 	}
 
-	defer func() { _ = response.Body.Close() }()
+	defer logger.WarnOnError(response.Body.Close, "Failed to close response body")
 	defer close(doneCh)
 
 	if response.StatusCode != http.StatusOK {
@@ -1226,7 +1228,7 @@ func (r *ProtocolIncus) CreateStoragePoolVolumeFromISO(pool string, args Storage
 		return nil, err
 	}
 
-	defer func() { _ = resp.Body.Close() }()
+	defer logger.WarnOnError(resp.Body.Close, "Failed to close response body")
 
 	// Handle errors.
 	response, _, err := incusParseResponse(resp)
@@ -1285,7 +1287,7 @@ func (r *ProtocolIncus) CreateStoragePoolVolumeFromBackup(pool string, args Stor
 		return nil, err
 	}
 
-	defer func() { _ = resp.Body.Close() }()
+	defer logger.WarnOnError(resp.Body.Close, "Failed to close response body")
 
 	// Handle errors.
 	response, _, err := incusParseResponse(resp)
@@ -1328,7 +1330,7 @@ func (r *ProtocolIncus) GetStoragePoolVolumeBlockNBDConn(pool string, volType st
 
 	r.setURLQueryAttributes(&u.URL)
 
-	return r.rawConn(&u.URL, "nbd")
+	return r.rawConn(http.MethodGet, &u.URL, "nbd", nil)
 }
 
 // GetStoragePoolVolumeFileSFTPConn returns a connection to the volume's SFTP endpoint.
@@ -1342,7 +1344,7 @@ func (r *ProtocolIncus) GetStoragePoolVolumeFileSFTPConn(pool string, volType st
 	u.Path("1.0", "storage-pools", pool, "volumes", volType, volName, "sftp")
 	r.setURLQueryAttributes(&u.URL)
 
-	return r.rawConn(&u.URL, "sftp")
+	return r.rawConn(http.MethodGet, &u.URL, "sftp", nil)
 }
 
 // GetStoragePoolVolumeFileSFTP returns an SFTP connection to the volume.
@@ -1533,7 +1535,8 @@ func (r *ProtocolIncus) GetStorageVolumeBitmapNames(pool string, volumeType stri
 	urls := []string{}
 	baseURL := fmt.Sprintf(
 		"/storage-pools/%s/volumes/%s/%s/bitmaps",
-		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName))
+		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName),
+	)
 	_, err := r.queryStruct("GET", baseURL, nil, "", &urls)
 	if err != nil {
 		return nil, err
@@ -1561,6 +1564,26 @@ func (r *ProtocolIncus) GetStorageVolumeBitmaps(pool string, volumeType string, 
 	}
 
 	return bitmaps, nil
+}
+
+// GetStorageVolumeBitmap returns information about a volume bitmap.
+func (r *ProtocolIncus) GetStorageVolumeBitmap(pool string, volumeType string, volumeName string, bitmapName string) (*api.StorageVolumeBitmap, error) {
+	if !r.HasExtension("storage_volume_nbd") {
+		return nil, errors.New("The server is missing the required \"storage_volume_nbd\" API extension")
+	}
+
+	bitmap := api.StorageVolumeBitmap{}
+
+	path := fmt.Sprintf(
+		"/storage-pools/%s/volumes/%s/%s/bitmaps/%s",
+		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName), url.PathEscape(bitmapName),
+	)
+	_, err := r.queryStruct("GET", path, nil, "", &bitmap)
+	if err != nil {
+		return nil, err
+	}
+
+	return &bitmap, nil
 }
 
 // CreateStorageVolumeBitmap creates a new volume bitmap.
@@ -1591,7 +1614,8 @@ func (r *ProtocolIncus) DeleteStorageVolumeBitmap(pool string, volumeType string
 
 	path := fmt.Sprintf(
 		"/storage-pools/%s/volumes/%s/%s/bitmaps/%s",
-		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName), url.PathEscape(bitmapName))
+		url.PathEscape(pool), url.PathEscape(volumeType), url.PathEscape(volumeName), url.PathEscape(bitmapName),
+	)
 
 	_, _, err := r.query("DELETE", path, nil, "")
 	if err != nil {

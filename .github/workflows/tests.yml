@@ -26,7 +26,7 @@ jobs:
           - tip
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Differential ShellCheck requires full git history
           fetch-depth: 0
@@ -55,13 +55,13 @@ jobs:
         if: github.event_name == 'pull_request' && matrix.go == 'stable'
 
       - name: Install Go (${{ matrix.go }})
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
         if: matrix.go != 'tip'
 
       - name: Install Go (stable)
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
         if: matrix.go == 'tip'
@@ -241,17 +241,23 @@ jobs:
           sudo ip link delete docker0
           sudo nft flush ruleset
 
+      - name: Remove pre-installed Java
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get remove --yes --purge temurin.*
+
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Go (${{ matrix.go }})
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
         if: matrix.go != 'tip'
 
       - name: Install Go (stable)
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
         if: matrix.go == 'tip'
@@ -265,6 +271,8 @@ jobs:
         if: matrix.go == 'tip'
 
       - name: Install dependencies
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -x
 
@@ -343,13 +351,21 @@ jobs:
           # Reclaim some space
           sudo apt-get clean
 
+          github_api_curl() {
+            curl -sSfL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "$@"
+          }
+
           # Download latest release of openfga server.
           mkdir -p "$(go env GOPATH)/bin/"
-          curl -sSfL https://api.github.com/repos/openfga/openfga/releases/latest | jq -r ".assets | .[] | .browser_download_url | select(. | test(\"_linux_$(dpkg --print-architecture).tar.gz$\"))" | xargs -I {} curl -sSfL {} -o openfga.tar.gz
+          github_api_curl https://api.github.com/repos/openfga/openfga/releases/latest | jq -r ".assets | .[] | .browser_download_url | select(. | test(\"_linux_$(dpkg --print-architecture).tar.gz$\"))" | xargs -I {} curl -sSfL {} -o openfga.tar.gz
           tar -xzf openfga.tar.gz -C "$(go env GOPATH)/bin/"
 
           # Download latest release of openfga cli.
-          curl -sSfL https://api.github.com/repos/openfga/cli/releases/latest | jq -r ".assets | .[] | .browser_download_url | select(. | test(\"_linux_$(dpkg --print-architecture).tar.gz$\"))" | xargs -I {} curl -sSfL {} -o fga.tar.gz
+          github_api_curl https://api.github.com/repos/openfga/cli/releases/latest | jq -r ".assets | .[] | .browser_download_url | select(. | test(\"_linux_$(dpkg --print-architecture).tar.gz$\"))" | xargs -I {} curl -sSfL {} -o fga.tar.gz
           tar -xzf fga.tar.gz -C "$(go env GOPATH)/bin/"
 
       - name: Download go dependencies
@@ -498,7 +514,7 @@ jobs:
           chmod +x ~
           echo "root:1000000:1000000000" | sudo tee /etc/subuid /etc/subgid
           cd test
-          sudo --preserve-env=PATH,GOPATH,GITHUB_ACTIONS,INCUS_VERBOSE,INCUS_BACKEND,INCUS_CEPH_CLUSTER,INCUS_CEPH_CEPHFS,INCUS_CEPH_CEPHOBJECT_RADOSGW,INCUS_LINSTOR_LOCAL_SATELLITE,INCUS_LINSTOR_CLUSTER,INCUS_OFFLINE,INCUS_SKIP_TESTS,INCUS_REQUIRED_TESTS, INCUS_BACKEND=${{ matrix.backend }} env LD_LIBRARY_PATH=${LD_LIBRARY_PATH} ./main.sh ${{ matrix.suite }}
+          sudo --preserve-env=PATH,GOPATH,GITHUB_ACTIONS,INCUS_VERBOSE,INCUS_BACKEND,INCUS_CEPH_CLUSTER,INCUS_CEPH_CEPHFS,INCUS_CEPH_CEPHOBJECT_RADOSGW,INCUS_LINSTOR_LOCAL_SATELLITE,INCUS_LINSTOR_CLUSTER,INCUS_OFFLINE,INCUS_SKIP_TESTS,INCUS_REQUIRED_TESTS, INCUS_BACKEND=${{ matrix.backend }} env LD_LIBRARY_PATH=${LD_LIBRARY_PATH} JAVA_HOME= ./main.sh ${{ matrix.suite }}
 
   client:
     name: Client
@@ -516,10 +532,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
 
@@ -563,14 +579,6 @@ jobs:
           GOARCH=amd64 go build -o bin/incus-migrate.x86_64 ./cmd/incus-migrate
           GOARCH=arm64 go build -o bin/incus-migrate.aarch64 ./cmd/incus-migrate
 
-      - name: Build static lxd-to-incus
-        if: runner.os == 'Linux'
-        env:
-          CGO_ENABLED: 0
-        run: |
-          GOARCH=amd64 go build -o bin/lxd-to-incus.x86_64 ./cmd/lxd-to-incus
-          GOARCH=arm64 go build -o bin/lxd-to-incus.aarch64 ./cmd/lxd-to-incus
-
       - name: Unit tests (client)
         env:
           CGO_ENABLED: 0
@@ -599,10 +607,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 

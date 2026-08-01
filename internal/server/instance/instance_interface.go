@@ -23,6 +23,8 @@ import (
 	"github.com/lxc/incus/v7/shared/api"
 	"github.com/lxc/incus/v7/shared/idmap"
 	"github.com/lxc/incus/v7/shared/ioprogress"
+	"github.com/lxc/incus/v7/shared/osinfo"
+	"github.com/lxc/incus/v7/shared/uefi"
 )
 
 // HookStart hook used when instance has started.
@@ -112,6 +114,7 @@ type Instance interface {
 	DeleteQcow2Snapshot(devName string, snapshotIndex int, backingFilename string) error
 	ExportQcow2Block(diskName string, blockIndex int) (func(), string, error)
 	ConnectNBD(diskName string, diskSize int64, writable bool) (net.Conn, func(), error)
+	ConnectNBDAllDisks(reuse bool) (net.Conn, func(), error)
 
 	// Config handling.
 	Rename(newName string, applyTemplateTrigger bool) error
@@ -128,6 +131,9 @@ type Instance interface {
 	// File handling.
 	FileSFTPConn() (net.Conn, error)
 	FileSFTP() (*sftp.Client, error)
+
+	// Network connectivity.
+	PortForwardConn(address string, port int) (net.Conn, error)
 
 	// Console - Allocate and run a console tty or a spice Unix socket.
 	Console(protocol string) (*os.File, chan error, error)
@@ -155,7 +161,7 @@ type Instance interface {
 	Description() string
 	CreationDate() time.Time
 	LastUsedDate() time.Time
-	GuestOS() string
+	GuestOS() osinfo.OSType
 
 	Profiles() []api.Profile
 	InitPID() int
@@ -221,6 +227,9 @@ type VM interface {
 	ConsoleLog() (string, error)
 	ConsoleScreenshot(screenshotFile *os.File) error
 	DumpGuestMemory(w *os.File, format string) error
+	GetNVRAM() (*uefi.Store, error)
+	SetNVRAM(store *uefi.Store) error
+	ResetNVRAM() error
 }
 
 // CriuMigrationArgs arguments for CRIU migration.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/revert"
 )
 
@@ -312,6 +314,10 @@ func (m *Monitor) SendFile(name string, file *os.File) error {
 	// Query the status.
 	_, err = m.qmp.runWithFile(reqJSON, file, id)
 	if err != nil {
+		if errors.Is(err, ErrMonitorTimeout) {
+			return err
+		}
+
 		// Confirm the daemon didn't die.
 		errPing := m.ping()
 		if errPing != nil {
@@ -368,6 +374,10 @@ func (m *Monitor) SendFileWithFDSet(name string, file *os.File, readonly bool) (
 
 	ret, err := m.qmp.runWithFile(reqJSON, file, id)
 	if err != nil {
+		if errors.Is(err, ErrMonitorTimeout) {
+			return nil, err
+		}
+
 		// Confirm the daemon didn't die.
 		errPing := m.ping()
 		if errPing != nil {
@@ -1140,34 +1150,68 @@ func (m *Monitor) SEVCapabilities() (AMDSEVCapabilities, error) {
 }
 
 // NBDServerStart starts internal NBD server and returns a connection to it.
-func (m *Monitor) NBDServerStart() (net.Conn, error) {
+func (m *Monitor) NBDServerStart(listenPath string, maxConnections int) (net.Conn, error) {
 	var args struct {
 		Addr struct {
-			Data struct {
-				Path     string `json:"path"`
-				Abstract bool   `json:"abstract"`
-			} `json:"data"`
-			Type string `json:"type"`
+			Data map[string]any `json:"data"`
+			Type string         `json:"type"`
 		} `json:"addr"`
 		MaxConnections int `json:"max-connections"`
 	}
 
-	// Create abstract unix listener.
-	listener, err := net.Listen("unix", "")
-	if err != nil {
-		return nil, fmt.Errorf("Failed creating unix listener: %w", err)
+	listenAddress := listenPath
+	if listenAddress == "" {
+		// Create abstract unix listener.
+		listener, err := net.Listen("unix", "")
+		if err != nil {
+			return nil, fmt.Errorf("Failed creating unix listener: %w", err)
+		}
+
+		// Get the random address, and then close the listener, and pass the address for use with nbd-server-start.
+		listenAddress = listener.Addr().String()
+		_ = listener.Close()
+
+		args.Addr.Type = "unix"
+		args.Addr.Data = map[string]any{
+			"path":     strings.TrimPrefix(listenAddress, "@"),
+			"abstract": true,
+		}
+	} else {
+		// QEMU may have dropped privileges, bind the socket ourselves and pass the FD.
+		err := os.Remove(listenPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("Failed to remove stale socket %q: %w", listenPath, err)
+		}
+
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: listenPath, Net: "unix"})
+		if err != nil {
+			return nil, fmt.Errorf("Failed creating unix listener: %w", err)
+		}
+
+		listener.SetUnlinkOnClose(false)
+
+		listenerFile, err := listener.File()
+		_ = listener.Close()
+		if err != nil {
+			return nil, fmt.Errorf("Failed getting listener file descriptor: %w", err)
+		}
+
+		defer func() { _ = listenerFile.Close() }()
+
+		err = m.SendFile(listenPath, listenerFile)
+		if err != nil {
+			return nil, fmt.Errorf("Failed sending listener file descriptor: %w", err)
+		}
+
+		args.Addr.Type = "fd"
+		args.Addr.Data = map[string]any{
+			"str": listenPath,
+		}
 	}
 
-	// Get the random address, and then close the listener, and pass the address for use with nbd-server-start.
-	listenAddress := listener.Addr().String()
-	_ = listener.Close()
+	args.MaxConnections = maxConnections
 
-	args.Addr.Type = "unix"
-	args.Addr.Data.Path = strings.TrimPrefix(listenAddress, "@")
-	args.Addr.Data.Abstract = true
-	args.MaxConnections = 1
-
-	err = m.Run("nbd-server-start", args, nil)
+	err := m.Run("nbd-server-start", args, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1215,12 +1259,14 @@ func (m *Monitor) NBDServerStop() error {
 	return nil
 }
 
-// NBDBlockExportAdd exports a writable device via the NBD server.
-func (m *Monitor) NBDBlockExportAdd(deviceNodeName string, writable bool, bitmapNames []string) error {
+// NBDBlockExportAdd adds a block export to the NBD server. Bitmaps are looked up on
+// bitmapNode, which defaults to the exported node when empty.
+func (m *Monitor) NBDBlockExportAdd(deviceNodeName string, exportName string, writable bool, bitmapNode string, bitmapNames []string) error {
 	var args struct {
 		ID       string `json:"id"`
 		Type     string `json:"type"`
 		NodeName string `json:"node-name"`
+		Name     string `json:"name"`
 		Writable bool   `json:"writable"`
 		Bitmaps  []struct {
 			Node string `json:"node"`
@@ -1231,14 +1277,19 @@ func (m *Monitor) NBDBlockExportAdd(deviceNodeName string, writable bool, bitmap
 	args.ID = deviceNodeName
 	args.Type = "nbd"
 	args.NodeName = deviceNodeName
+	args.Name = exportName
 	args.Writable = writable
+
+	if bitmapNode == "" {
+		bitmapNode = deviceNodeName
+	}
 
 	for _, b := range bitmapNames {
 		args.Bitmaps = append(args.Bitmaps, struct {
 			Node string `json:"node"`
 			Name string `json:"name"`
 		}{
-			Node: deviceNodeName,
+			Node: bitmapNode,
 			Name: b,
 		})
 	}
@@ -1357,21 +1408,102 @@ func (m *Monitor) BlockDevSnapshot(deviceNodeName string, snapshotNodeName strin
 	return nil
 }
 
-// blockJobWaitReady waits until the specified jobID is ready, errored or missing.
-// Returns nil if the job is ready, otherwise an error.
-func (m *Monitor) blockJobWaitReady(jobID string, exitOnNotFound bool) error {
+// BlockDevBackupTarget describes a single blockdev-backup action.
+type BlockDevBackupTarget struct {
+	Device string `json:"device"`
+	Target string `json:"target"`
+	Sync   string `json:"sync"`
+	JobID  string `json:"job-id"`
+}
+
+// BlockDevBackupTransaction atomically starts the given blockdev-backup jobs in a single
+// transaction so that all targets share the same point in time.
+func (m *Monitor) BlockDevBackupTransaction(backups []BlockDevBackupTarget) error {
+	type action struct {
+		Type string               `json:"type"`
+		Data BlockDevBackupTarget `json:"data"`
+	}
+
+	actions := make([]action, 0, len(backups))
+	for _, backup := range backups {
+		actions = append(actions, action{
+			Type: "blockdev-backup",
+			Data: backup,
+		})
+	}
+
+	var args struct {
+		Actions []action `json:"actions"`
+	}
+
+	args.Actions = actions
+
+	err := m.Run("transaction", args, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// BlockNodeSize returns the virtual size in bytes of the given block node.
+func (m *Monitor) BlockNodeSize(nodeName string) (int64, error) {
+	var resp struct {
+		Return []struct {
+			NodeName string `json:"node-name"`
+			Image    struct {
+				VirtualSize int64 `json:"virtual-size"`
+			} `json:"image"`
+		} `json:"return"`
+	}
+
+	err := m.Run("query-named-block-nodes", nil, &resp)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, node := range resp.Return {
+		if node.NodeName == nodeName {
+			return node.Image.VirtualSize, nil
+		}
+	}
+
+	return 0, fmt.Errorf("Block node %q not found", nodeName)
+}
+
+// blockJobDismiss dismisses a concluded block job.
+func (m *Monitor) blockJobDismiss(jobID string) error {
+	var args struct {
+		ID string `json:"id"`
+	}
+
+	args.ID = jobID
+
+	err := m.Run("job-dismiss", args, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// blockJobWait waits until the specified jobID is ready (when waitReady is true), reached
+// its final state or is missing. Concluded jobs are dismissed and their error, if any, is
+// returned. The returned boolean is true when the job concluded rather than turned ready.
+func (m *Monitor) blockJobWait(jobID string, waitReady bool, exitOnNotFound bool) (bool, error) {
 	for {
 		var resp struct {
 			Return []struct {
 				Device string `json:"device"`
 				Ready  bool   `json:"ready"`
 				Error  string `json:"error"`
+				Status string `json:"status"`
 			} `json:"return"`
 		}
 
 		err := m.Run("query-block-jobs", nil, &resp)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		found := false
@@ -1380,21 +1512,34 @@ func (m *Monitor) blockJobWaitReady(jobID string, exitOnNotFound bool) error {
 				continue
 			}
 
-			if job.Error != "" {
-				return fmt.Errorf("Failed block job: %s", job.Error)
+			if job.Status == "concluded" {
+				err := m.blockJobDismiss(jobID)
+				if err != nil {
+					logger.Warn("Failed dismissing block job", logger.Ctx{"jobID": jobID, "err": err})
+				}
+
+				if job.Error != "" {
+					return true, fmt.Errorf("Failed block job: %s", job.Error)
+				}
+
+				return true, nil
 			}
 
-			if job.Ready {
-				return nil
+			if job.Error != "" {
+				return true, fmt.Errorf("Failed block job: %s", job.Error)
+			}
+
+			if waitReady && job.Ready {
+				return false, nil
 			}
 
 			found = true
 		}
 
 		if !found && !exitOnNotFound {
-			return errors.New("Specified block job not found")
+			return true, errors.New("Specified block job not found")
 		} else if !found && exitOnNotFound {
-			return nil
+			return true, nil
 		}
 
 		time.Sleep(1 * time.Second)
@@ -1404,16 +1549,21 @@ func (m *Monitor) blockJobWaitReady(jobID string, exitOnNotFound bool) error {
 // BlockCommit merges a snapshot device back into its parent device.
 func (m *Monitor) BlockCommit(deviceNodeName string, top string, base string) error {
 	var args struct {
-		Device string `json:"device"`
-		JobID  string `json:"job-id"`
-		Top    string `json:"top-node,omitempty"`
-		Base   string `json:"base-node,omitempty"`
+		Device      string `json:"device"`
+		JobID       string `json:"job-id"`
+		Top         string `json:"top-node,omitempty"`
+		Base        string `json:"base-node,omitempty"`
+		AutoDismiss bool   `json:"auto-dismiss"`
 	}
 
 	args.Device = deviceNodeName
 	args.JobID = args.Device
 	args.Top = top
 	args.Base = base
+
+	// Keep failed jobs around so their actual error can be retrieved,
+	// blockJobWait takes care of dismissing them.
+	args.AutoDismiss = false
 
 	err := m.Run("block-commit", args, nil)
 	if err != nil {
@@ -1423,12 +1573,12 @@ func (m *Monitor) BlockCommit(deviceNodeName string, top string, base string) er
 	// From QEMU doc: If top has no overlays on top of it, or if it is in use by a writer,
 	// the job will not be completed by itself.
 	hasTop := top != deviceNodeName && top != ""
-	err = m.blockJobWaitReady(args.JobID, hasTop)
+	concluded, err := m.blockJobWait(args.JobID, !hasTop, hasTop)
 	if err != nil {
 		return err
 	}
 
-	if !hasTop {
+	if !concluded {
 		err = m.BlockJobComplete(args.JobID)
 		if err != nil {
 			return err
@@ -1465,7 +1615,7 @@ func (m *Monitor) BlockDevMirror(deviceNodeName string, targetNodeName string) e
 		return err
 	}
 
-	err = m.blockJobWaitReady(args.JobID, false)
+	_, err = m.blockJobWait(args.JobID, true, false)
 	if err != nil {
 		return err
 	}
@@ -1489,7 +1639,22 @@ func (m *Monitor) BlockJobCancel(deviceNodeName string) error {
 	return nil
 }
 
-// BlockJobComplete completes a block job that is in reader state.
+// BlockJobCancelWait cancels an ongoing block job and waits until it is gone.
+func (m *Monitor) BlockJobCancelWait(jobID string) error {
+	err := m.BlockJobCancel(jobID)
+	if err != nil {
+		return err
+	}
+
+	_, err = m.blockJobWait(jobID, false, true)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// BlockJobComplete completes a block job that is in ready state.
 func (m *Monitor) BlockJobComplete(deviceNodeName string) error {
 	var args struct {
 		Device string `json:"device"`
@@ -1497,26 +1662,18 @@ func (m *Monitor) BlockJobComplete(deviceNodeName string) error {
 
 	args.Device = deviceNodeName
 
-	ch, err := m.CreateEventChannel(args.Device)
+	err := m.Run("block-job-complete", args, nil)
 	if err != nil {
 		return err
 	}
 
-	err = m.Run("block-job-complete", args, nil)
+	// Wait for the job to reach its final state and report its result.
+	_, err = m.blockJobWait(args.Device, false, true)
 	if err != nil {
 		return err
 	}
 
-	event := <-ch
-
-	switch event.Name {
-	case EventBlockJobCompleted:
-		return nil
-	case EventBlockJobError:
-		return fmt.Errorf("Error during block-job-complete")
-	default:
-		return fmt.Errorf("Not supported event: %q", event.Name)
-	}
+	return nil
 }
 
 // UpdateBlockSize updates the size of a disk.
@@ -1740,12 +1897,39 @@ func (m *Monitor) DumpGuestMemory(path string, format string) error {
 
 	args.Protocol = "fd:" + path
 	args.Format = format
+	args.Detach = true
 
 	var queryResp struct {
 		Return struct{} `json:"return"`
 	}
 
-	return m.Run("dump-guest-memory", args, &queryResp)
+	err := m.Run("dump-guest-memory", args, &queryResp)
+	if err != nil {
+		return err
+	}
+
+	// Wait for completion.
+	for {
+		var resp struct {
+			Return struct {
+				Status string `json:"status"`
+			} `json:"return"`
+		}
+
+		err := m.Run("query-dump", nil, &resp)
+		if err != nil {
+			return err
+		}
+
+		switch resp.Return.Status {
+		case "completed":
+			return nil
+		case "failed":
+			return errors.New("Guest memory dump failed")
+		}
+
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // SetNICLink sets the link status of the given device.

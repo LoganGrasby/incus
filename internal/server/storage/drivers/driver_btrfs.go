@@ -18,6 +18,7 @@ import (
 	"github.com/lxc/incus/v7/internal/server/operations"
 	internalUtil "github.com/lxc/incus/v7/internal/util"
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/revert"
 	"github.com/lxc/incus/v7/shared/subprocess"
 	"github.com/lxc/incus/v7/shared/units"
@@ -36,15 +37,6 @@ type btrfs struct {
 
 // load is used to run one-time action per-driver rather than per-pool.
 func (d *btrfs) load() error {
-	// Register the patches.
-	d.patches = map[string]func() error{
-		"storage_lvm_skipactivation":                         nil,
-		"storage_missing_snapshot_records":                   nil,
-		"storage_delete_old_snapshot_records":                nil,
-		"storage_zfs_drop_block_volume_filesystem_extension": nil,
-		"storage_prefix_bucket_names_with_project":           nil,
-	}
-
 	// Done if previously loaded.
 	if btrfsLoaded {
 		return nil
@@ -192,6 +184,18 @@ func (d *btrfs) Create() error {
 		}
 	} else if d.config["source"] != "" {
 		hostPath := d.config["source"]
+		cleanSource := filepath.Clean(hostPath)
+		daemonDir := internalUtil.VarPath()
+
+		// Restrict source paths under the daemon directory to the pool's own mount path.
+		// Anything else gets bind-mounted over the daemon directory layout on pool mount,
+		// aliasing paths like the image cache into the pool.
+		if cleanSource == daemonDir || strings.HasPrefix(cleanSource, daemonDir+"/") {
+			if cleanSource != GetPoolMountPath(d.name) {
+				return fmt.Errorf("Only allowed source path under %q is %q", internalUtil.VarPath(), GetPoolMountPath(d.name))
+			}
+		}
+
 		if d.isSubvolume(hostPath) {
 			// Existing btrfs subvolume.
 			hasSubvolumes, err := d.hasSubvolumes(hostPath)
@@ -205,9 +209,6 @@ func (d *btrfs) Create() error {
 			}
 		} else {
 			// New btrfs subvolume on existing btrfs filesystem.
-			cleanSource := filepath.Clean(hostPath)
-			daemonDir := internalUtil.VarPath()
-
 			if util.PathExists(hostPath) {
 				hostPathFS, _ := linux.DetectFilesystem(hostPath)
 				if hostPathFS != "btrfs" {
@@ -215,11 +216,7 @@ func (d *btrfs) Create() error {
 				}
 			}
 
-			if strings.HasPrefix(cleanSource, daemonDir) {
-				if cleanSource != GetPoolMountPath(d.name) {
-					return fmt.Errorf("Only allowed source path under %q is %q", internalUtil.VarPath(), GetPoolMountPath(d.name))
-				}
-
+			if cleanSource == GetPoolMountPath(d.name) {
 				storagePoolDirFS, _ := linux.DetectFilesystem(internalUtil.VarPath("storage-pools"))
 				if storagePoolDirFS != "btrfs" {
 					return fmt.Errorf("Provided path does not reside on a btrfs filesystem (detected %s)", storagePoolDirFS)
@@ -356,7 +353,7 @@ func (d *btrfs) Validate(config map[string]string) error {
 		"btrfs.create_options": validate.IsAny,
 	}
 
-	return d.validatePool(config, rules, nil)
+	return d.validatePool(config, rules, d.commonVolumeRules())
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -395,7 +392,7 @@ func (d *btrfs) Update(changedConfig map[string]string) error {
 			return err
 		}
 
-		defer func() { _ = f.Close() }()
+		defer logger.WarnOnError(f.Close, "Failed to close file")
 
 		sizeBytes, _ := units.ParseByteSizeString(size)
 
@@ -409,7 +406,7 @@ func (d *btrfs) Update(changedConfig map[string]string) error {
 			return err
 		}
 
-		defer func() { _ = loopDeviceAutoDetach(loopDevPath) }()
+		defer logger.WarnOnError(func() error { return loopDeviceAutoDetach(loopDevPath) }, "Failed to detach loop device")
 
 		err = loopDeviceSetCapacity(loopDevPath)
 		if err != nil {
@@ -445,7 +442,7 @@ func (d *btrfs) Mount() (bool, error) {
 			return false, err
 		}
 
-		defer func() { _ = loopDeviceAutoDetach(mntSrc) }()
+		defer logger.WarnOnError(func() error { return loopDeviceAutoDetach(mntSrc) }, "Failed to detach loop device")
 	} else if filepath.IsAbs(d.config["source"]) {
 		// Bring up an existing device or path.
 		mntSrc = d.config["source"]

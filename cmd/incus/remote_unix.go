@@ -39,11 +39,12 @@ func (c *cmdRemoteProxy) command() *cobra.Command {
 	cmd.Use = cli.U("proxy", cmdRemoteProxyUsage...)
 	cmd.Short = i18n.G("Run a local API proxy")
 	cmd.Long = cli.FormatSection(color.DescriptionPrefix, i18n.G(
-		`Run a local API proxy for the remote`))
+		`Run a local API proxy for the remote`,
+	))
 
 	cmd.RunE = c.run
 
-	cli.AddIntFlag(cmd.Flags(), &c.flagTimeout, "timeout", 0, i18n.G("Proxy timeout (exits when no connections)"))
+	cli.AddIntFlag(cmd.Flags(), &c.flagTimeout, "timeout", i18n.G("Proxy timeout (exits when no connections)"), 0)
 
 	return cmd
 }

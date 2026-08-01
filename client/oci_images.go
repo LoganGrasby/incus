@@ -1,7 +1,6 @@
 package incus
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -17,7 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/pgzip"
+
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/archive"
 	"github.com/lxc/incus/v7/shared/ioprogress"
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/osarch"
@@ -162,7 +164,7 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 		return nil, err
 	}
 
-	defer func() { _ = os.RemoveAll(ociPath) }()
+	defer logger.WarnOnError(func() error { return os.RemoveAll(ociPath) }, "Failed to remove temporary directory")
 
 	err = os.Mkdir(filepath.Join(ociPath, "oci"), 0o700)
 	if err != nil {
@@ -184,7 +186,8 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 	stdout, err := r.runSkopeo(
 		"copy", info.Alias,
 		"--remove-signatures",
-		fmt.Sprintf("oci:%s:%s", filepath.Join(ociPath, "oci"), imageTag))
+		fmt.Sprintf("oci:%s:%s", filepath.Join(ociPath, "oci"), imageTag),
+	)
 	if err != nil {
 		logger.Debug("Error copying remote image to local", logger.Ctx{"image": info.Alias, "stdout": stdout, "stderr": err})
 		return nil, err
@@ -233,8 +236,8 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 
 	// Push the metadata tarball.
 	pipeRead, pipeWrite = io.Pipe()
-	defer pipeRead.Close()
-	defer pipeWrite.Close()
+	defer logger.WarnOnError(pipeRead.Close, "Failed to close pipe reader")
+	defer logger.WarnOnError(pipeWrite.Close, "Failed to close pipe writer")
 
 	if req.ProgressHandler != nil {
 		pipeRead = &ioprogress.ProgressReader{
@@ -247,7 +250,12 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 		}
 	}
 
-	compressWrite := gzip.NewWriter(pipeWrite)
+	compressWrite := pgzip.NewWriter(pipeWrite)
+	err = compressWrite.SetConcurrency(1<<20, archive.CompressionThreads())
+	if err != nil {
+		return nil, err
+	}
+
 	metadataProcess := subprocess.NewProcessWithFds("tar", []string{"-cf", "-", "-C", filepath.Join(ociPath, "image"), "config.json", "metadata.yaml"}, nil, compressWrite, os.Stderr)
 	err = metadataProcess.Start(ctx)
 	if err != nil {
@@ -256,8 +264,8 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 
 	go func() {
 		_, _ = metadataProcess.Wait(ctx)
-		compressWrite.Close()
-		pipeWrite.Close()
+		_ = compressWrite.Close()
+		_ = pipeWrite.Close()
 	}()
 
 	size, err := util.SafeCopy(req.MetaFile, pipeRead)
@@ -269,8 +277,8 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 
 	// Push the rootfs tarball.
 	pipeRead, pipeWrite = io.Pipe()
-	defer pipeRead.Close()
-	defer pipeWrite.Close()
+	defer logger.WarnOnError(pipeRead.Close, "Failed to close pipe reader")
+	defer logger.WarnOnError(pipeWrite.Close, "Failed to close pipe writer")
 
 	if req.ProgressHandler != nil {
 		pipeRead = &ioprogress.ProgressReader{
@@ -283,7 +291,12 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 		}
 	}
 
-	compressWrite = gzip.NewWriter(pipeWrite)
+	compressWrite = pgzip.NewWriter(pipeWrite)
+	err = compressWrite.SetConcurrency(1<<20, archive.CompressionThreads())
+	if err != nil {
+		return nil, err
+	}
+
 	rootfsProcess := subprocess.NewProcessWithFds("tar", []string{"-cf", "-", "-C", filepath.Join(ociPath, "image", "rootfs"), "."}, nil, compressWrite, nil)
 	err = rootfsProcess.Start(ctx)
 	if err != nil {
@@ -292,8 +305,8 @@ func (r *ProtocolOCI) GetImageFile(fingerprint string, req ImageFileRequest) (*I
 
 	go func() {
 		_, _ = rootfsProcess.Wait(ctx)
-		compressWrite.Close()
-		pipeWrite.Close()
+		_ = compressWrite.Close()
+		_ = pipeWrite.Close()
 	}()
 
 	size, err = util.SafeCopy(req.RootfsFile, pipeRead)
@@ -370,7 +383,7 @@ func (r *ProtocolOCI) runSkopeo(action string, image string, args ...string) (st
 			return "", err
 		}
 
-		defer authFile.Close()
+		defer logger.WarnOnError(authFile.Close, "Failed to close auth file")
 		defer os.Remove(authFile.Name())
 
 		err = authFile.Chmod(0o600)
@@ -398,7 +411,8 @@ func (r *ProtocolOCI) runSkopeo(action string, image string, args ...string) (st
 		env,
 		nil,
 		"skopeo",
-		args...)
+		args...,
+	)
 	if err != nil {
 		return "", err
 	}

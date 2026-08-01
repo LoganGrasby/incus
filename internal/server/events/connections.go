@@ -64,7 +64,7 @@ func (e *websockListenerConnection) Reader(ctx context.Context, recvFunc EventHa
 		}
 
 		err := e.Close()
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
 		}
 
@@ -186,7 +186,7 @@ func (e *streamListenerConnection) Reader(ctx context.Context, recvFunc EventHan
 		}
 
 		err := e.Close()
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
 		}
 
@@ -220,7 +220,7 @@ func (e *streamListenerConnection) WriteJSON(event any) error {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	err := e.SetWriteDeadline(time.Now().Add(5 * (time.Second)))
+	err := e.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err != nil {
 		return fmt.Errorf("Failed setting write deadline: %w", err)
 	}
@@ -258,7 +258,7 @@ func (e *simpleListenerConnection) Reader(ctx context.Context, recvFunc EventHan
 		}
 
 		err := e.Close()
-		if err != nil {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Warn("Failed closing connection", logger.Ctx{"err": err})
 		}
 

@@ -17,6 +17,7 @@ import (
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	internalIO "github.com/lxc/incus/v7/internal/io"
+	"github.com/lxc/incus/v7/internal/server/auth"
 	"github.com/lxc/incus/v7/internal/server/backup"
 	"github.com/lxc/incus/v7/internal/server/cluster"
 	"github.com/lxc/incus/v7/internal/server/db"
@@ -313,6 +314,11 @@ func createFromMigration(ctx context.Context, s *state.State, r *http.Request, p
 		}
 	}
 
+	// Refuse to migrate onto an existing instance of a different type.
+	if inst != nil && inst.Type() != dbType {
+		return response.Conflict(fmt.Errorf("Instance %q already exists with a different type", req.Name))
+	}
+
 	reverter := revert.New()
 	defer reverter.Fail()
 
@@ -555,7 +561,9 @@ func validateDependentVolumes(source instance.Instance, req *api.InstancesPost) 
 		}
 
 		// Check if the source was overridden.
-		if oldDevice["source"] == newDevice["source"] {
+		oldVolName, _ := internalInstance.SplitVolumeSource(oldDevice["source"])
+		newVolName, _ := internalInstance.SplitVolumeSource(newDevice["source"])
+		if oldVolName == newVolName {
 			return fmt.Errorf("Device source name should be different during copy for dependent disk: %s", key)
 		}
 	}
@@ -701,6 +709,15 @@ func createFromCopy(ctx context.Context, s *state.State, r *http.Request, projec
 		req.Devices[key] = value
 	}
 
+	// Re-check project restrictions against the fully merged config, as the source
+	// instance's config and devices (including restricted keys) are only merged in above.
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return project.AllowInstanceCreation(tx, targetProject, *req)
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	if req.Stateful {
 		sourceName, _, _ := api.GetParentAndSnapshotName(source.Name())
 		if sourceName != req.Name {
@@ -775,7 +792,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 		return response.InternalError(err)
 	}
 
-	defer func() { _ = os.Remove(backupFile.Name()) }()
+	defer logger.WarnOnError(func() error { return os.Remove(backupFile.Name()) }, "Failed to remove backup file")
 	reverter.Add(func() { _ = backupFile.Close() })
 
 	// Get disk budget for the project if any.
@@ -820,7 +837,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 			return response.InternalError(err)
 		}
 
-		defer func() { _ = os.Remove(tarFile.Name()) }()
+		defer logger.WarnOnError(func() error { return os.Remove(tarFile.Name()) }, "Failed to remove tarball file")
 
 		// Decompress to tarFile temporary file.
 		err = archive.ExtractWithFds(decomArgs[0], decomArgs[1:], nil, nil, tarFile)
@@ -878,6 +895,19 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 	// Override instance name.
 	if instanceName != "" {
 		bInfo.Name = instanceName
+	}
+
+	// Validate the instance and snapshot names to avoid path traversal when used as path segments.
+	err = instance.ValidName(bInfo.Name, false)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	for _, snapName := range bInfo.Snapshots {
+		err = instance.ValidName(bInfo.Name+internalInstance.SnapshotDelimiter+snapName, true)
+		if err != nil {
+			return response.BadRequest(err)
+		}
 	}
 
 	// Override config.
@@ -965,7 +995,7 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 	runReverter := reverter.Clone()
 
 	run := func(op *operations.Operation) error {
-		defer func() { _ = backupFile.Close() }()
+		defer logger.WarnOnError(backupFile.Close, "Failed to close backup file")
 		defer runReverter.Fail()
 
 		pool, err := storagePools.LoadByName(s, bInfo.Pool)
@@ -1035,6 +1065,12 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 			if err != nil {
 				return fmt.Errorf("Post hook failed: %w", err)
 			}
+		}
+
+		// Drop any metadata image from the backup as its bitmaps may not match the restored disk content.
+		err = instanceDropImageMetadata(pool, inst, op)
+		if err != nil {
+			return err
 		}
 
 		// And wrap up validation by running a check on all snapshots too.
@@ -1135,6 +1171,10 @@ func createFromBackup(s *state.State, r *http.Request, projectName string, data 
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instancesPost(d *Daemon, r *http.Request) response.Response {
@@ -1171,8 +1211,10 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 		req.Config = map[string]string{}
 	}
 
+	var instanceTypeDisk int64
+
 	if req.InstanceType != "" {
-		conf, err := instanceParseType(req.InstanceType)
+		conf, disk, err := instanceParseType(req.InstanceType)
 		if err != nil {
 			return response.BadRequest(err)
 		}
@@ -1182,6 +1224,8 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 				req.Config[k] = v
 			}
 		}
+
+		instanceTypeDisk = disk
 	}
 
 	// Special handling for instance refresh.
@@ -1221,6 +1265,20 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 	target := request.QueryParam(r, "target")
 	if !s.ServerClustered && target != "" {
 		return response.BadRequest(errors.New("Target only allowed when clustered"))
+	}
+
+	// For a copy, check that the caller is allowed to view the source instance before any of its details are loaded.
+	if req.Source.Type == "copy" && req.Source.Source != "" {
+		sourceProject := req.Source.Project
+		if sourceProject == "" {
+			sourceProject = targetProjectName
+		}
+
+		sourceName, _, _ := api.GetParentAndSnapshotName(req.Source.Source)
+		err = s.Authorizer.CheckPermission(r.Context(), r, auth.ObjectInstance(sourceProject, sourceName), auth.EntitlementCanView)
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -1321,12 +1379,12 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 				return err
 			}
 
-			dbProfileConfigs, err := dbCluster.GetAllProfileConfigs(ctx, tx.Tx())
+			dbProfileConfigs, err := dbCluster.GetReferencedProfileConfigs(ctx, tx.Tx(), dbProfiles)
 			if err != nil {
 				return err
 			}
 
-			dbProfileDevices, err := dbCluster.GetAllProfileDevices(ctx, tx.Tx())
+			dbProfileDevices, err := dbCluster.GetReferencedProfileDevices(ctx, tx.Tx(), dbProfiles)
 			if err != nil {
 				return err
 			}
@@ -1348,6 +1406,32 @@ func instancesPost(d *Daemon, r *http.Request) response.Response {
 				}
 
 				profiles = append(profiles, *apiProfile)
+			}
+		}
+
+		// Apply the instance type's disk size to the root disk device.
+		if instanceTypeDisk > 0 {
+			size := fmt.Sprintf("%dB", instanceTypeDisk)
+
+			_, rootDev, rootErr := internalInstance.GetRootDiskDevice(req.Devices)
+			if rootErr == nil {
+				if rootDev["size"] == "" {
+					rootDev["size"] = size
+				}
+			} else {
+				// Take over the root disk device from the profiles.
+				for i := len(profiles) - 1; i >= 0; i-- {
+					devName, dev, rootErr := internalInstance.GetRootDiskDevice(profiles[i].Devices)
+					if rootErr != nil {
+						continue
+					}
+
+					newDev := map[string]string{}
+					maps.Copy(newDev, dev)
+					newDev["size"] = size
+					req.Devices[devName] = newDev
+					break
+				}
 			}
 		}
 

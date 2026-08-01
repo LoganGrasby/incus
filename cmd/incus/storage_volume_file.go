@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -93,18 +94,20 @@ func (c *cmdStorageVolumeFileCreate) command() *cobra.Command {
 	cmd.Use = cli.U("create", cmdStorageVolumeFileCreateUsage...)
 	cmd.Short = i18n.G("Create files and directories in custom vollume")
 	cmd.Long = cli.FormatSection(color.DescriptionPrefix, i18n.G(
-		`Create files and directories in custom volume`))
+		`Create files and directories in custom volume`,
+	))
 	cmd.Example = cli.FormatSection("", i18n.G(
 		`incus storage volume file create foo bar/baz
    To create a file baz in the bar volume on the foo pool.
 
 incus file create --type=symlink foo bar/baz qux
-   To create a symlink qux in bar storage volume on the foo pool whose target is baz.`))
+   To create a symlink qux in bar storage volume on the foo pool whose target is baz.`,
+	))
 
 	cli.AddBoolFlag(cmd.Flags(), &c.storageVolumeFile.flagMkdir, "create-dirs|p", i18n.G("Create any directories necessary"))
 	cli.AddBoolFlag(cmd.Flags(), &c.flagForce, "force|f", i18n.G("Force creating files or directories"))
-	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagGID, "gid", -1, i18n.G("Set the file's gid on create"))
-	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagUID, "uid", -1, i18n.G("Set the file's uid on create"))
+	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagGID, "gid", i18n.G("Set the file's gid on create"), -1)
+	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagUID, "uid", i18n.G("Set the file's uid on create"), -1)
 	cli.AddStringFlag(cmd.Flags(), &c.storageVolumeFile.flagMode, "mode", "", "", i18n.G("Set the file's perms on create"))
 	cli.AddStringFlag(cmd.Flags(), &c.flagType, "type|t", "file", "", i18n.G("The type to create (file, symlink, or directory)"))
 
@@ -132,7 +135,7 @@ func (c *cmdStorageVolumeFileCreate) run(cmd *cobra.Command, args []string) erro
 	volName := parsed[1].List[0].String
 	targetPath, isDir := normalizePath(parsed[1].List[1].String)
 	isSymlink := !parsed[2].Skipped
-	symlinkTargetPath := filepath.Clean(parsed[2].String)
+	symlinkTargetPath := path.Clean(parsed[2].String)
 
 	if !slices.Contains([]string{"file", "symlink", "directory"}, c.flagType) {
 		return fmt.Errorf(i18n.G("Invalid type %q"), c.flagType)
@@ -152,7 +155,7 @@ func (c *cmdStorageVolumeFileCreate) run(cmd *cobra.Command, args []string) erro
 		return err
 	}
 
-	defer func() { _ = sftpConn.Close() }()
+	defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 	// Determine the target uid
 	uid := max(c.storageVolumeFile.flagUID, 0)
@@ -185,7 +188,7 @@ func (c *cmdStorageVolumeFileCreate) run(cmd *cobra.Command, args []string) erro
 
 	// Create needed paths if requested
 	if c.storageVolumeFile.flagMkdir {
-		err := sftpRecursiveMkdir(sftpConn, filepath.Dir(targetPath), nil, int64(uid), int64(gid))
+		err := sftpRecursiveMkdir(sftpConn, path.Dir(targetPath), nil, int64(uid), int64(gid))
 		if err != nil {
 			return err
 		}
@@ -296,7 +299,7 @@ func (c *cmdStorageVolumeFileDelete) run(cmd *cobra.Command, args []string) erro
 		return err
 	}
 
-	defer func() { _ = sftpConn.Close() }()
+	defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 	if c.flagForce {
 		err = sftpConn.RemoveAll(fPath)
@@ -335,7 +338,8 @@ func (c *cmdStorageVolumeFileMount) command() *cobra.Command {
 	cmd.Short = i18n.G("Mount files from custom storage volumes")
 	cmd.Long = cli.FormatSection(color.DescriptionPrefix, i18n.G(
 		`Mount files from custom storage volumes.
-If no target path is provided, start an SSH SFTP listener instead.`))
+If no target path is provided, start an SSH SFTP listener instead.`,
+	))
 	cmd.Example = cli.FormatSection("", i18n.G(`incus storage volume file mount mypool myvolume localdir
    To mount the storage volume myvolume from pool mypool onto the local directory localdir.
 
@@ -403,7 +407,7 @@ func (c *cmdStorageVolumeFileMount) run(cmd *cobra.Command, args []string) error
 			return fmt.Errorf(i18n.G("Failed connecting to instance SFTP: %w"), err)
 		}
 
-		defer func() { _ = sftpConn.Close() }()
+		defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 		return sshfsMount(cmd.Context(), sftpConn, entity, "", targetPath)
 	}
@@ -463,7 +467,7 @@ func (c *cmdStorageVolumeFileEdit) run(cmd *cobra.Command, args []string) error 
 	}
 
 	// Create temp file
-	f, err := os.CreateTemp("", fmt.Sprintf("incus_file_edit_*%s", filepath.Ext(fPath)))
+	f, err := os.CreateTemp("", fmt.Sprintf("incus_file_edit_*%s", path.Ext(fPath)))
 	if err != nil {
 		return fmt.Errorf(i18n.G("Unable to create a temporary file: %v"), err)
 	}
@@ -477,7 +481,7 @@ func (c *cmdStorageVolumeFileEdit) run(cmd *cobra.Command, args []string) error 
 	c.filePush.edit = true
 
 	// Extract current value
-	defer func() { _ = os.Remove(fname) }()
+	defer logger.WarnOnError(func() error { return os.Remove(fname) }, "Failed to remove temporary file")
 	err = c.filePull.pull(parsed[0], parsed[1], fname)
 	if err != nil {
 		return err
@@ -521,7 +525,8 @@ func (c *cmdStorageVolumeFilePull) command() *cobra.Command {
    To pull /etc/hosts from the custom volume and write it to the current directory.
 
 incus file pull local v1 foo/etc/hosts -
-   To pull /etc/hosts from the custom volume and write its output to standard output.`))
+   To pull /etc/hosts from the custom volume and write its output to standard output.`,
+	))
 
 	cli.AddBoolFlag(cmd.Flags(), &c.storageVolumeFile.flagMkdir, "create-dirs|p", i18n.G("Create any directories necessary"))
 	cli.AddBoolFlag(cmd.Flags(), &c.puller.flagRecursive, "recursive|r", i18n.G("Recursively transfer files"))
@@ -591,7 +596,7 @@ func (c *cmdStorageVolumeFilePull) pull(parsedPool *u.Parsed, parsedPath *u.Pars
 		return fmt.Errorf(i18n.G("Failed connecting to instance SFTP: %w"), err)
 	}
 
-	defer func() { _ = sftpConn.Close() }()
+	defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 	srcInfo, normalizedPath, err := c.puller.statFile(sftpConn, fPath)
 	if err != nil {
@@ -605,7 +610,7 @@ func (c *cmdStorageVolumeFilePull) pull(parsedPool *u.Parsed, parsedPath *u.Pars
 
 	var targetPath string
 	if targetIsDir {
-		targetPath = filepath.Join(target, filepath.Base(normalizedPath))
+		targetPath = filepath.Join(target, path.Base(normalizedPath))
 	} else {
 		targetPath = target
 	}
@@ -628,7 +633,7 @@ func (c *cmdStorageVolumeFilePull) pull(parsedPool *u.Parsed, parsedPath *u.Pars
 			return err
 		}
 
-		defer func() { _ = f.Close() }() // nolint:revive
+		defer logger.WarnOnError(f.Close, "Failed to close file") // nolint:revive
 
 		err = os.Chmod(targetPath, os.FileMode(srcInfo.Mode()))
 		if err != nil {
@@ -670,7 +675,7 @@ func (c *cmdStorageVolumeFilePull) pull(parsedPool *u.Parsed, parsedPath *u.Pars
 			return err
 		}
 
-		defer func() { _ = src.Close() }()
+		defer logger.WarnOnError(src.Close, "Failed to close source file")
 
 		_, err = util.SafeCopy(writer, src)
 		if err != nil {
@@ -716,11 +721,12 @@ func (c *cmdStorageVolumeFilePush) command() *cobra.Command {
    To push /etc/hosts into the custom volume "v1".
 
 echo "Hello world" | incus storage volume file push - local v1 test
-   To read "Hello world" from standard input and write it into test in volume "v1".`))
+   To read "Hello world" from standard input and write it into test in volume "v1".`,
+	))
 
 	cli.AddBoolFlag(cmd.Flags(), &c.storageVolumeFile.flagMkdir, "create-dirs|p", i18n.G("Create any directories necessary"))
-	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagUID, "uid", -1, i18n.G("Set the file's uid on push"))
-	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagGID, "gid", -1, i18n.G("Set the file's gid on push"))
+	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagUID, "uid", i18n.G("Set the file's uid on push"), -1)
+	cli.AddIntFlag(cmd.Flags(), &c.storageVolumeFile.flagGID, "gid", i18n.G("Set the file's gid on push"), -1)
 	cli.AddStringFlag(cmd.Flags(), &c.storageVolumeFile.flagMode, "mode", "", "", i18n.G("Set the file's perms on push"))
 	cli.AddBoolFlag(cmd.Flags(), &c.pusher.flagRecursive, "recursive|r", i18n.G("Recursively transfer files"))
 	cli.AddBoolFlag(cmd.Flags(), &c.pusher.flagNoDereference, "no-dereference|P", i18n.G("Never follow symbolic links in source path"))
@@ -754,7 +760,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 		return fmt.Errorf(i18n.G("Failed connecting to instance SFTP: %w"), err)
 	}
 
-	defer func() { _ = sftpConn.Close() }()
+	defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 	targetInfo, err := sftpConn.Stat(target)
 	if err == nil {
@@ -786,6 +792,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 	var f *os.File
 	var linkTarget string
 	var size int64
+	usePercentage := true
 	args := incus.InstanceFileArgs{
 		UID:  int64(c.storageVolumeFile.flagUID),
 		GID:  int64(c.storageVolumeFile.flagGID),
@@ -798,6 +805,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 		}
 
 		f = os.Stdin
+		usePercentage = false
 	} else {
 		srcInfo, wPath, err := c.pusher.statFile(srcFile)
 		if err != nil {
@@ -821,7 +829,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 			}
 
 			size = srcInfo.Size()
-			defer func() { _ = f.Close() }()
+			defer logger.WarnOnError(f.Close, "Failed to close file")
 		}
 
 		dMode, dUID, dGID := internalIO.GetOwnerMode(srcInfo)
@@ -842,7 +850,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 	// Determine the target path.
 	var targetPath string
 	if targetIsDir {
-		targetPath = filepath.Join(target, filepath.Base(srcFile))
+		targetPath = path.Join(target, filepath.Base(srcFile))
 	} else {
 		targetPath = target
 	}
@@ -850,7 +858,7 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 	// Create needed paths if requested
 	if c.storageVolumeFile.flagMkdir {
 		mode := os.FileMode(DirMode)
-		err = sftpRecursiveMkdir(sftpConn, filepath.Dir(targetPath), &mode, int64(args.UID), int64(args.GID))
+		err = sftpRecursiveMkdir(sftpConn, path.Dir(targetPath), &mode, int64(args.UID), int64(args.GID))
 		if err != nil {
 			return err
 		}
@@ -879,10 +887,12 @@ func (c *cmdStorageVolumeFilePush) push(srcFile string, parsedPool *u.Parsed, pa
 			ReadCloser: f,
 			Tracker: &ioprogress.ProgressTracker{
 				Length: size,
-				Handler: func(percent int64, speed int64) {
-					progress.UpdateProgress(ioprogress.ProgressData{
-						Text: fmt.Sprintf("%d%% (%s/s)", percent, units.GetByteSizeString(speed, 2)),
-					})
+				Handler: func(v int64, speed int64) {
+					if usePercentage {
+						progress.UpdateProgress(ioprogress.ProgressData{Text: fmt.Sprintf("%d%% (%s/s)", v, units.GetByteSizeString(speed, 2))})
+					} else {
+						progress.UpdateProgress(ioprogress.ProgressData{Text: fmt.Sprintf("%s (%s/s)", units.GetByteSizeString(v, 2), units.GetByteSizeString(speed, 2))})
+					}
 				},
 			},
 		}, f)

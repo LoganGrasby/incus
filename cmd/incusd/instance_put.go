@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
 
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
 	"github.com/lxc/incus/v7/internal/server/db"
@@ -63,6 +61,12 @@ import (
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
+//	  "412":
+//	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instancePut(d *Daemon, r *http.Request) response.Response {
@@ -74,7 +78,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 	projectName := request.ProjectParam(r)
 
 	// Get the container
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -138,12 +142,12 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 				return err
 			}
 
-			profileConfigs, err := cluster.GetAllProfileConfigs(ctx, tx.Tx())
+			profileConfigs, err := cluster.GetReferencedProfileConfigs(ctx, tx.Tx(), profiles)
 			if err != nil {
 				return err
 			}
 
-			profileDevices, err := cluster.GetAllProfileDevices(ctx, tx.Tx())
+			profileDevices, err := cluster.GetReferencedProfileDevices(ctx, tx.Tx(), profiles)
 			if err != nil {
 				return err
 			}
@@ -238,6 +242,23 @@ func instanceSnapRestore(s *state.State, projectName string, name string, snap s
 	}
 
 	source.SetOperation(op)
+
+	// Ensure restoring the snapshot's config doesn't violate project restrictions.
+	profiles := make([]string, 0, len(source.Profiles()))
+	for _, profile := range source.Profiles() {
+		profiles = append(profiles, profile.Name)
+	}
+
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		return projecthelpers.AllowInstanceUpdate(tx, projectName, name, api.InstancePut{
+			Config:   source.LocalConfig(),
+			Devices:  source.LocalDevices().CloneNative(),
+			Profiles: profiles,
+		}, inst.LocalConfig())
+	})
+	if err != nil {
+		return err
+	}
 
 	// Generate a new `volatile.uuid.generation` to differentiate this instance restored from a snapshot from the original instance.
 	source.LocalConfig()["volatile.uuid.generation"] = uuid.New().String()

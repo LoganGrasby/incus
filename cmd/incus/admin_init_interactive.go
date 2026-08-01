@@ -83,7 +83,7 @@ func (c *cmdAdminInit) runInteractive(_ *cobra.Command, d incus.InstanceServer, 
 			object = *config
 		}
 
-		out, err := yaml.Dump(object, yaml.V2)
+		out, err := yaml.Dump(object, yaml.WithV2Defaults())
 		if err != nil {
 			return nil, fmt.Errorf(i18n.G("Failed to render the config: %w"), err)
 		}
@@ -169,11 +169,11 @@ func (c *cmdAdminInit) askNetworking(config *api.InitPreseed, d incus.InstanceSe
 
 		// IPv4
 		network.Config["ipv4.address"], err = c.global.asker.AskString(i18n.G("What IPv4 address should be used?")+" (CIDR subnet notation, “auto” or “none”) [default=auto]: ", "auto", func(value string) error {
-			if slices.Contains([]string{"auto", "none"}, value) {
+			if slices.Contains([]string{"auto", "none", ""}, value) {
 				return nil
 			}
 
-			return validate.Optional(validate.IsNetworkAddressCIDRV4)(value)
+			return validate.IsNetworkAddressCIDRV4(value, false)
 		})
 		if err != nil {
 			return err
@@ -190,11 +190,11 @@ func (c *cmdAdminInit) askNetworking(config *api.InitPreseed, d incus.InstanceSe
 
 		// IPv6
 		network.Config["ipv6.address"], err = c.global.asker.AskString(i18n.G("What IPv6 address should be used?")+" (CIDR subnet notation, “auto” or “none”) [default=auto]: ", "auto", func(value string) error {
-			if slices.Contains([]string{"auto", "none"}, value) {
+			if slices.Contains([]string{"auto", "none", ""}, value) {
 				return nil
 			}
 
-			return validate.Optional(validate.IsNetworkAddressCIDRV6)(value)
+			return validate.IsNetworkAddressCIDRV6(value, false)
 		})
 		if err != nil {
 			return err

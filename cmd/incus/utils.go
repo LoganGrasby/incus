@@ -10,7 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"path"
 	"reflect"
 	"slices"
 	"sort"
@@ -25,6 +25,7 @@ import (
 	"github.com/lxc/incus/v7/internal/i18n"
 	"github.com/lxc/incus/v7/shared/api"
 	config "github.com/lxc/incus/v7/shared/cliconfig"
+	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/termios"
 	localtls "github.com/lxc/incus/v7/shared/tls"
 	"github.com/lxc/incus/v7/shared/util"
@@ -325,13 +326,18 @@ type settable interface {
 // unsetKey reparses the last argument passed to an `unset` command to make it suitable for `set`
 // commands.
 func unsetKey(s settable, cmd *cobra.Command, parsed []*u.Parsed) error {
-	i := len(parsed) - 1
-	parsed[i], _ = u.KV.List(0).Parse(u.Config{}, nil, &[]string{parsed[i].String + "="})
+	last := len(parsed) - 1
+	args := make([]string, len(parsed[last].StringList))
+	for i, arg := range parsed[last].StringList {
+		args[i] = arg + "="
+	}
+
+	parsed[last], _ = u.KV.List(1).Parse(u.Config{}, nil, &args)
 	return s.set(cmd, parsed)
 }
 
-func readEnvironmentFile(path string) (map[string]string, error) {
-	content, err := os.ReadFile(path)
+func readEnvironmentFile(p string) (map[string]string, error) {
+	content, err := os.ReadFile(p)
 	if err != nil {
 		return nil, fmt.Errorf(i18n.G("Can't read from environment file: %w"), err)
 	}
@@ -638,7 +644,7 @@ func sshSFTPServer(ctx context.Context, sftpConn func() (net.Conn, error), authN
 		go func() {
 			fmt.Printf(i18n.G("SSH client connected %q")+"\n", nConn.RemoteAddr())
 			defer fmt.Printf(i18n.G("SSH client disconnected %q")+"\n", nConn.RemoteAddr())
-			defer func() { _ = nConn.Close() }()
+			defer logger.WarnOnError(nConn.Close, "Failed to close connection")
 
 			// Before use, a handshake must be performed on the incoming net.Conn.
 			_, chans, reqs, err := ssh.NewServerConn(nConn, sshConfig)
@@ -688,7 +694,7 @@ func sshSFTPServer(ctx context.Context, sftpConn func() (net.Conn, error), authN
 
 				// Handle each channel in its own go routine.
 				go func() {
-					defer func() { _ = channel.Close() }()
+					defer logger.WarnOnError(channel.Close, "Failed to close channel")
 
 					// Connect to the instance's SFTP server.
 					sftpConn, err := sftpConn()
@@ -697,7 +703,7 @@ func sshSFTPServer(ctx context.Context, sftpConn func() (net.Conn, error), authN
 						return
 					}
 
-					defer func() { _ = sftpConn.Close() }()
+					defer logger.WarnOnError(sftpConn.Close, "Failed to close SFTP connection")
 
 					// Copy SFTP data between client and remote instance.
 					ctx, cancel := context.WithCancel(ctx)
@@ -737,18 +743,19 @@ func formatRemote(conf *config.Config, p *u.Parsed) string {
 }
 
 // normalizePath normalizes a path and return whether it looks like a directory.
-func normalizePath(path string) (string, bool) {
-	// On Windows, the SFTP server expects the file path to start with `/`.
-	path = "/" + path
-	return filepath.Clean(path), strings.HasSuffix(path, "/")
+func normalizePath(p string) (string, bool) {
+	// The SFTP server expects a `/` separated path starting with `/`, so use
+	// the slash-only "path" logic regardless of the client platform.
+	p = "/" + p
+	return path.Clean(p), strings.HasSuffix(p, "/")
 }
 
 // isStdin returns whether the provided path looks like stdin.
-func isStdin(path string) bool {
-	return slices.Contains([]string{"-", "/dev/stdin", "/dev/fd/0"}, path)
+func isStdin(p string) bool {
+	return slices.Contains([]string{"-", "/dev/stdin", "/dev/fd/0"}, p)
 }
 
 // isStdout returns whether the provided path looks like stdout.
-func isStdout(path string) bool {
-	return slices.Contains([]string{"-", "/dev/stdout", "/dev/fd/1"}, path)
+func isStdout(p string) bool {
+	return slices.Contains([]string{"-", "/dev/stdout", "/dev/fd/1"}, p)
 }

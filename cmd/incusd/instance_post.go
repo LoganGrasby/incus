@@ -7,11 +7,8 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"net/url"
 	"slices"
 	"strings"
-
-	"github.com/gorilla/mux"
 
 	incus "github.com/lxc/incus/v7/client"
 	internalInstance "github.com/lxc/incus/v7/internal/instance"
@@ -78,6 +75,10 @@ import (
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func instancePost(d *Daemon, r *http.Request) response.Response {
@@ -90,7 +91,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 	projectName := request.ProjectParam(r)
 	target := request.QueryParam(r, "target")
 
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -366,12 +367,12 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 						return err
 					}
 
-					dbProfileConfigs, err := dbCluster.GetAllProfileConfigs(ctx, tx.Tx())
+					dbProfileConfigs, err := dbCluster.GetReferencedProfileConfigs(ctx, tx.Tx(), dbProfiles)
 					if err != nil {
 						return err
 					}
 
-					dbProfileDevices, err := dbCluster.GetAllProfileDevices(ctx, tx.Tx())
+					dbProfileDevices, err := dbCluster.GetReferencedProfileDevices(ctx, tx.Tx(), dbProfiles)
 					if err != nil {
 						return err
 					}
@@ -496,7 +497,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		// Setup the instance move operation.
 		run := func(op *operations.Operation) error {
 			inst.SetOperation(op)
-			return migrateInstance(context.TODO(), s, inst, req, sourceMemberInfo, targetMemberInfo, targetGroupName, op)
+			return migrateInstance(context.TODO(), s, inst, req, sourceMemberInfo, targetMemberInfo, targetGroupName, op, nil)
 		}
 
 		resources := map[string][]api.URL{}
@@ -546,7 +547,13 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 }
 
 // Perform the server-side migration.
-func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance, req api.InstancePost, sourceMemberInfo *db.NodeInfo, targetMemberInfo *db.NodeInfo, targetGroupName string, op *operations.Operation) error {
+func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance, req api.InstancePost, sourceMemberInfo *db.NodeInfo, targetMemberInfo *db.NodeInfo, targetGroupName string, op *operations.Operation, progressHandler func(newOp api.Operation)) error {
+	if progressHandler == nil {
+		progressHandler = func(newOp api.Operation) {
+			_ = op.UpdateMetadata(newOp.Metadata)
+		}
+	}
+
 	// Load the instance storage pool.
 	sourcePool, err := storagePools.LoadByInstance(s, inst)
 	if err != nil {
@@ -640,6 +647,15 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 		targetInstInfo.Profiles = req.Profiles
 	}
 
+	// Enforce project restrictions against the overridden config, as the migration
+	// request can otherwise set restricted keys (e.g. security.privileged, raw.lxc).
+	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		return project.AllowInstanceUpdate(tx, inst.Project().Name, inst.Name(), targetInstInfo.Writable(), inst.LocalConfig())
+	})
+	if err != nil {
+		return err
+	}
+
 	// Handle storage pool override.
 	if req.Pool != "" {
 		err := s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
@@ -728,12 +744,12 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 					return err
 				}
 
-				profileConfigs, err := dbCluster.GetAllProfileConfigs(ctx, tx.Tx())
+				profileConfigs, err := dbCluster.GetReferencedProfileConfigs(ctx, tx.Tx(), rawProfiles)
 				if err != nil {
 					return err
 				}
 
-				profileDevices, err := dbCluster.GetAllProfileDevices(ctx, tx.Tx())
+				profileDevices, err := dbCluster.GetReferencedProfileDevices(ctx, tx.Tx(), rawProfiles)
 				if err != nil {
 					return err
 				}
@@ -807,11 +823,7 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 		}
 
 		// Setup a progress handler.
-		handler := func(newOp api.Operation) {
-			_ = op.UpdateMetadata(newOp.Metadata)
-		}
-
-		_, err = destOp.AddHandler(handler)
+		_, err = destOp.AddHandler(progressHandler)
 		if err != nil {
 			return err
 		}
@@ -956,11 +968,7 @@ func migrateInstance(ctx context.Context, s *state.State, inst instance.Instance
 		}
 
 		// Setup a progress handler.
-		handler := func(newOp api.Operation) {
-			_ = op.UpdateMetadata(newOp.Metadata)
-		}
-
-		_, err = destOp.AddHandler(handler)
+		_, err = destOp.AddHandler(progressHandler)
 		if err != nil {
 			return err
 		}
@@ -1091,11 +1099,14 @@ func cleanupDependentDisks(s *state.State, inst instance.Instance, deviceOverrid
 			return fmt.Errorf("Failed loading storage pool: %w", err)
 		}
 
+		volName, _ := internalInstance.SplitVolumeSource(dev.Config["source"])
+
 		// If new disk was created than delete source volume.
 		override, ok := deviceOverrides[dev.Name]
 		if ok {
-			if (override["source"] != "" && override["source"] != dev.Config["source"]) || (override["pool"] != "" && override["pool"] != dev.Config["pool"]) {
-				_ = diskPool.DeleteCustomVolume(inst.Project().Name, dev.Config["source"], op)
+			overrideVolName, _ := internalInstance.SplitVolumeSource(override["source"])
+			if (override["source"] != "" && overrideVolName != volName) || (override["pool"] != "" && override["pool"] != dev.Config["pool"]) {
+				_ = diskPool.DeleteCustomVolume(inst.Project().Name, volName, op)
 			}
 		}
 
@@ -1104,7 +1115,7 @@ func cleanupDependentDisks(s *state.State, inst instance.Instance, deviceOverrid
 			return nil
 		}
 
-		_ = diskPool.DeleteCustomVolume(inst.Project().Name, dev.Config["source"], op)
+		_ = diskPool.DeleteCustomVolume(inst.Project().Name, volName, op)
 
 		return nil
 	})

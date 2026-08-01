@@ -70,6 +70,7 @@ import (
 	"github.com/lxc/incus/v7/internal/server/project"
 	"github.com/lxc/incus/v7/internal/server/response"
 	"github.com/lxc/incus/v7/internal/server/seccomp"
+	"github.com/lxc/incus/v7/internal/server/selinux"
 	"github.com/lxc/incus/v7/internal/server/state"
 	storagePools "github.com/lxc/incus/v7/internal/server/storage"
 	storageDrivers "github.com/lxc/incus/v7/internal/server/storage/drivers"
@@ -80,6 +81,7 @@ import (
 	"github.com/lxc/incus/v7/shared/ioprogress"
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/osarch"
+	"github.com/lxc/incus/v7/shared/osinfo"
 	"github.com/lxc/incus/v7/shared/revert"
 	"github.com/lxc/incus/v7/shared/subprocess"
 	"github.com/lxc/incus/v7/shared/termios"
@@ -87,6 +89,15 @@ import (
 	"github.com/lxc/incus/v7/shared/util"
 	"github.com/lxc/incus/v7/shared/ws"
 )
+
+// OCINetworkInterface is the expected network configuration for an OCI container interface.
+// It is consumed by the forknet dhcp process through the container's interfaces.json file.
+type OCINetworkInterface struct {
+	DHCP4  bool `json:"dhcp4"`
+	DHCP6  bool `json:"dhcp6"`
+	Route4 bool `json:"route4"`
+	Route6 bool `json:"route6"`
+}
 
 // Helper functions.
 func lxcSetConfigItem(c *liblxc.Container, key string, value string) error {
@@ -151,6 +162,32 @@ func lxcSetConfigItem(c *liblxc.Container, key string, value string) error {
 	}
 
 	return nil
+}
+
+// lxcEncodeCmd encodes a command for lxc.init.cmd/lxc.execute.cmd, whose
+// parser only supports whole-word quoting with no escape sequences.
+func lxcEncodeCmd(args []string) (string, error) {
+	words := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg != "" && !strings.ContainsAny(arg, " \t\n\v\f\r") && !strings.HasPrefix(arg, "'") && !strings.HasPrefix(arg, "\"") {
+			words = append(words, arg)
+			continue
+		}
+
+		if !strings.Contains(arg, "\"") {
+			words = append(words, "\""+arg+"\"")
+			continue
+		}
+
+		if !strings.Contains(arg, "'") {
+			words = append(words, "'"+arg+"'")
+			continue
+		}
+
+		return "", fmt.Errorf("Unable to encode command argument: %q", arg)
+	}
+
+	return strings.Join(words, " "), nil
 }
 
 func lxcStatusCode(lxcState liblxc.State) api.StatusCode {
@@ -996,15 +1033,14 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 	}
 
 	// Setup SELinux.
-	if d.state.OS.SELinuxAvailable && d.state.OS.SELinuxContextInstanceLXC != "" {
-		seContext, err := d.selinuxContext(d.state.OS.SELinuxContextInstanceLXC)
-		if err != nil {
-			return nil, err
-		}
-
-		err = lxcSetConfigItem(cc, "lxc.selinux.context", seContext)
-		if err != nil {
-			return nil, err
+	if d.state.OS.SELinuxEnabled {
+		selinuxContext := d.localConfig["volatile.selinux.context"]
+		if selinuxContext != "" {
+			logger.Debug("Setting SELinux context for container", logger.Ctx{"instance": d.Name(), "context": selinuxContext})
+			err = lxcSetConfigItem(cc, "lxc.selinux.context", selinuxContext)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1054,7 +1090,7 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 		after, ok := strings.CutPrefix(k, "environment.")
 		if ok {
 			// LXC supports quoting the value between " even if the value itself contains ".
-			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("%s=\"%s\"", after, v))
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("\"%s=%s\"", after, v))
 			if err != nil {
 				return nil, err
 			}
@@ -1100,23 +1136,23 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 				return nil, err
 			}
 		} else {
-			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_DRIVER_CAPABILITIES=\"%s\"", nvidiaDriver))
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("\"NVIDIA_DRIVER_CAPABILITIES=%s\"", nvidiaDriver))
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		nvidiaRequireCuda := d.expandedConfig["nvidia.require.cuda"]
-		if nvidiaRequireCuda == "" {
-			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_REQUIRE_CUDA=\"%s\"", nvidiaRequireCuda))
+		if nvidiaRequireCuda != "" {
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("\"NVIDIA_REQUIRE_CUDA=%s\"", nvidiaRequireCuda))
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		nvidiaRequireDriver := d.expandedConfig["nvidia.require.driver"]
-		if nvidiaRequireDriver == "" {
-			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_REQUIRE_DRIVER=\"%s\"", nvidiaRequireDriver))
+		if nvidiaRequireDriver != "" {
+			err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("\"NVIDIA_REQUIRE_DRIVER=%s\"", nvidiaRequireDriver))
 			if err != nil {
 				return nil, err
 			}
@@ -1156,7 +1192,10 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 				if util.IsTrueOrEmpty(memorySwap) || util.IsFalse(memorySwap) {
 					err = cg.SetMemorySwapLimit(0)
 					if err != nil {
-						return nil, err
+						// Ignore missing swap accounting unless explicitly configured.
+						if memorySwap != "" || !errors.Is(err, cgroup.ErrControllerMissing) {
+							return nil, err
+						}
 					}
 				} else {
 					// Additional memory as swap.
@@ -1629,7 +1668,7 @@ func (d *lxc) deviceDetachNIC(configCopy map[string]string, netIF []deviceConfig
 			return err
 		}
 
-		defer func() { _ = cc.Release() }()
+		defer logger.WarnOnError(cc.Release, "Failed to release container")
 
 		// Get interfaces inside container.
 		ifaces, err := cc.Interfaces()
@@ -1714,7 +1753,7 @@ func (d *lxc) deviceHandleMounts(mounts []deviceConfig.MountEntryItem) error {
 					return err
 				}
 
-				defer func() { _ = files.Close() }()
+				defer logger.WarnOnError(files.Close, "Failed to close SFTP connection")
 
 				_, err = files.Lstat(relativeTargetPath)
 				if err == nil {
@@ -1810,7 +1849,7 @@ func (d *lxc) DeviceEventHandler(runConf *deviceConfig.RunConfig) error {
 			return err
 		}
 
-		defer func() { _ = pidFd.Close() }()
+		defer logger.WarnOnError(pidFd.Close, "Failed to close PID fd")
 
 		for _, eventParts := range runConf.Uevents {
 			length := 0
@@ -1834,7 +1873,8 @@ func (d *lxc) DeviceEventHandler(runConf *deviceConfig.RunConfig) error {
 				nil,
 				[]*os.File{pidFd},
 				d.state.OS.ExecPath,
-				args...)
+				args...,
+			)
 			if err != nil {
 				return err
 			}
@@ -1933,6 +1973,89 @@ func (d *lxc) handleIdmappedStorage() (idmap.StorageType, *idmap.Set, error) {
 	return idmapType, nextIdmap, nil
 }
 
+// selinuxEnsureContext generates and persists the SELinux context for this instance.
+// Returns true if we need to relabel the rootfs, false if labeling is not required or wanted.
+func (d *lxc) selinuxEnsureContext() (bool, error) {
+	if !d.state.OS.SELinuxEnabled {
+		return false, nil
+	}
+
+	previousCtx := d.localConfig["volatile.selinux.context"]
+
+	allocLevel := func() (string, func(), error) {
+		used, err := d.selinuxCollectUsedLevels()
+		if err != nil {
+			return "", nil, err
+		}
+
+		return selinux.AllocateLevel(used)
+	}
+
+	ctx, needsPersist, release, err := selinux.InstanceContext(d.state.OS, instancetype.Container, d.localConfig, d.expandedConfig, allocLevel)
+	if err != nil {
+		return false, err
+	}
+
+	defer release()
+
+	if ctx == "" {
+		return false, nil
+	}
+
+	if needsPersist {
+		err = d.VolatileSet(map[string]string{"volatile.selinux.context": ctx})
+		if err != nil {
+			return false, fmt.Errorf("Failed to persist SELinux context: %w", err)
+		}
+	}
+
+	// Return true if this is the first time a context was generated.
+	return previousCtx == "", nil
+}
+
+// selinuxLabelFiles applies SELinux file labels to the instance rootfs.
+func (d *lxc) selinuxLabelFiles(contextIsNew bool) error {
+	if !d.state.OS.SELinuxEnabled {
+		return nil
+	}
+
+	ctx := d.localConfig["volatile.selinux.context"]
+	if ctx == "" {
+		return nil
+	}
+
+	skipPath := ""
+
+	rootfsMode := d.expandedConfig["security.selinux.label_rootfs"]
+	if rootfsMode == "" {
+		rootfsMode = "auto"
+	}
+
+	logger.Debug("SELinux label mode", logger.Ctx{"mode": rootfsMode})
+
+	switch rootfsMode {
+	case "auto":
+		// Skip re-labeling if not first start and level is explicitly set.
+		if !contextIsNew && d.localConfig["security.selinux.level"] != "" {
+			skipPath = d.RootfsPath()
+		}
+
+	case "never":
+		skipPath = d.RootfsPath()
+	case "always":
+		// Always relabel on every start.
+	default:
+		return fmt.Errorf("Invalid security.selinux.label_rootfs value: %q", rootfsMode)
+	}
+
+	fileCtx := selinux.InstanceFileContext(ctx, instancetype.Container, d.expandedConfig)
+	if fileCtx == "" {
+		return fmt.Errorf("Failed to derive file context from %q", ctx)
+	}
+
+	return selinux.LabelTree(d.Path(), fileCtx, skipPath)
+}
+
 // Start functions.
 func (d *lxc) startCommon() (string, []func() error, error) {
 	postStartHooks := []func() error{}
@@ -1979,6 +2102,12 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 			// Invalidate the idmap cache.
 			d.idmapset = nil
 		}
+	}
+
+	// Ensure SELinux context is generated and persisted.
+	contextIsNew, err := d.selinuxEnsureContext()
+	if err != nil {
+		return "", nil, err
 	}
 
 	// Load the go-lxc struct
@@ -2240,7 +2369,8 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 					" ", "\\040",
 					"\t", "\\011",
 					"\n", "\\012",
-					"\\", "\\\\")
+					"\\", "\\\\",
+				)
 				return r.Replace(mountPath)
 			}
 
@@ -2310,6 +2440,12 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		}
 	}
 
+	// Label rootfs if SELinux context is set and labels are missing.
+	err = d.selinuxLabelFiles(contextIsNew)
+	if err != nil {
+		return "", nil, err
+	}
+
 	// Initialize the credentials directory.
 	err = d.setupCredentials(false)
 	if err != nil {
@@ -2318,7 +2454,7 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 
 	// Override NVIDIA_VISIBLE_DEVICES if we have devices that need it.
 	if len(nvidiaDevices) > 0 {
-		err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=\"%s\"", strings.Join(nvidiaDevices, ",")))
+		err = lxcSetConfigItem(cc, "lxc.environment", fmt.Sprintf("\"NVIDIA_VISIBLE_DEVICES=%s\"", strings.Join(nvidiaDevices, ",")))
 		if err != nil {
 			return "", nil, fmt.Errorf("Unable to set NVIDIA_VISIBLE_DEVICES in LXC environment: %w", err)
 		}
@@ -2382,12 +2518,11 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 			}
 		}
 
-		// Compute the entrypoint string.
-		initCmd := shellquote.Join(entrypoint...)
-
-		// As we feed this to execve and not to a real shell, un-escape some sequences.
-		initCmd = strings.ReplaceAll(initCmd, "\\(", "(")
-		initCmd = strings.ReplaceAll(initCmd, "\\)", ")")
+		// Compute the entrypoint string using LXC's own quoting rules.
+		initCmd, err := lxcEncodeCmd(entrypoint)
+		if err != nil {
+			return "", nil, err
+		}
 
 		if len(entrypoint) > 0 && slices.Contains([]string{"/init", "/sbin/init", "/s6-init", "/usr/bin/init"}, entrypoint[0]) {
 			// For regular init systems, call them directly as PID1.
@@ -2482,8 +2617,16 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		}
 
 		// Configure network handling.
-		err = os.MkdirAll(filepath.Join(d.Path(), "network"), 0o711)
+		// Confine all writes to the instance directory to avoid following image-planted symlinks.
+		instRoot, err := os.OpenRoot(d.Path())
 		if err != nil {
+			return "", nil, err
+		}
+
+		defer logger.WarnOnError(instRoot.Close, "Failed to close instance root")
+
+		err = instRoot.Mkdir("network", 0o711)
+		if err != nil && !errors.Is(err, fs.ErrExist) {
 			return "", nil, err
 		}
 
@@ -2492,7 +2635,7 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 			return "", nil, err
 		}
 
-		err = os.WriteFile(filepath.Join(d.Path(), "network", "hosts"), fmt.Appendf(nil, `127.0.0.1   localhost
+		err = instRoot.WriteFile("network/hosts", fmt.Appendf(nil, `127.0.0.1   localhost
 127.0.1.1   %s
 
 ::1     localhost ip6-localhost ip6-loopback
@@ -2510,7 +2653,7 @@ ff02::2 ip6-allrouters
 			return "", nil, err
 		}
 
-		err = os.WriteFile(filepath.Join(d.Path(), "network", "hostname"), fmt.Appendf(nil, "%s\n", d.name), 0o644)
+		err = instRoot.WriteFile("network/hostname", fmt.Appendf(nil, "%s\n", d.name), 0o644)
 		if err != nil {
 			return "", nil, err
 		}
@@ -2520,14 +2663,51 @@ ff02::2 ip6-allrouters
 			return "", nil, err
 		}
 
-		f, err := os.OpenFile(filepath.Join(d.Path(), "network", "resolv.conf"), os.O_RDWR|os.O_CREATE, 0o644)
+		// Generate the initial resolv.conf from the DNS settings (extended later over DHCP).
+		var resolvConf strings.Builder
+		for _, ns := range util.SplitNTrimSpace(d.expandedConfig["oci.dns.nameservers"], ",", -1, true) {
+			fmt.Fprintf(&resolvConf, "nameserver %s\n", ns)
+		}
+
+		if d.expandedConfig["oci.dns.search"] != "" {
+			fmt.Fprintf(&resolvConf, "search %s\n", strings.Join(util.SplitNTrimSpace(d.expandedConfig["oci.dns.search"], ",", -1, true), " "))
+		}
+
+		if d.expandedConfig["oci.dns.domain"] != "" {
+			fmt.Fprintf(&resolvConf, "domain %s\n", d.expandedConfig["oci.dns.domain"])
+		}
+
+		err = instRoot.WriteFile("network/resolv.conf", []byte(resolvConf.String()), 0o644)
 		if err != nil {
 			return "", nil, err
 		}
 
-		f.Close()
-
 		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s etc/resolv.conf none bind,create=file", filepath.Join(d.Path(), "network", "resolv.conf")))
+		if err != nil {
+			return "", nil, err
+		}
+
+		// Record the expected network configuration for each interface.
+		ifaces := map[string]OCINetworkInterface{}
+		for _, dev := range d.expandedDevices.Sorted() {
+			if dev.Config["type"] != "nic" || dev.Config["name"] == "" {
+				continue
+			}
+
+			ifaces[dev.Config["name"]] = OCINetworkInterface{
+				DHCP4:  dev.Config["ipv4.address"] != "none" && !strings.Contains(dev.Config["ipv4.address"], "/"),
+				DHCP6:  dev.Config["ipv6.address"] != "none" && !strings.Contains(dev.Config["ipv6.address"], "/"),
+				Route4: dev.Config["ipv4.gateway"] != "none",
+				Route6: dev.Config["ipv6.gateway"] != "none",
+			}
+		}
+
+		ifacesData, err := json.Marshal(ifaces)
+		if err != nil {
+			return "", nil, err
+		}
+
+		err = instRoot.WriteFile("network/interfaces.json", ifacesData, 0o644)
 		if err != nil {
 			return "", nil, err
 		}
@@ -2553,6 +2733,13 @@ ff02::2 ip6-allrouters
 			return "", nil, err
 		}
 	} else {
+		// OCI specific configuration keys aren't valid on regular containers.
+		for key, value := range d.expandedConfig {
+			if value != "" && strings.HasPrefix(key, "oci.") {
+				return "", nil, fmt.Errorf("%q is only supported on OCI containers", key)
+			}
+		}
+
 		// Clear OCI config key if present.
 		if d.expandedConfig["volatile.container.oci"] != "" {
 			volatileSet["volatile.container.oci"] = ""
@@ -2882,7 +3069,7 @@ func (d *lxc) Start(stateful bool) error {
 
 	name := project.Instance(d.Project().Name, d.name)
 
-	// Setup minimal environment for forkstart.
+	// Setup minimal environment for forklxc.
 	envDict := map[string]string{
 		"container": "lxc",
 	}
@@ -2916,11 +3103,12 @@ func (d *lxc) Start(stateful bool) error {
 		env,
 		nil,
 		d.state.OS.ExecPath,
-		"forkstart",
+		"forklxc",
 		name,
 		d.state.OS.LxcPath,
 		configPath,
-		d.LogPath())
+		d.LogPath(),
+	)
 	if err != nil && !d.IsRunning() {
 		// Attempt to extract the LXC errors
 		lxcLog := ""
@@ -3370,6 +3558,46 @@ func (d *lxc) Rebuild(img *api.Image, op *operations.Operation) error {
 	return d.rebuildCommon(d, img, op)
 }
 
+// stopDHCPClient kills the forknet dhcp process if any and waits for it to
+// exit so the container's cgroup can be fully cleaned up.
+func (d *lxc) stopDHCPClient() {
+	pidPath := filepath.Join(d.Path(), "network", "dhcp.pid")
+
+	dhcpPIDStr, err := os.ReadFile(pidPath)
+	if err != nil {
+		return
+	}
+
+	dhcpPID, err := strconv.Atoi(strings.TrimSpace(string(dhcpPIDStr)))
+	if err != nil {
+		return
+	}
+
+	pidFd, err := linux.PidFdOpen(dhcpPID, 0)
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = pidFd.Close() }()
+
+	// Guard against PID reuse.
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", dhcpPID))
+	if err != nil || (!strings.HasPrefix(string(cmdline), "[incus dhcp]") && !strings.Contains(string(cmdline), "forknet\x00dhcp")) {
+		return
+	}
+
+	err = linux.PidfdSendSignal(int(pidFd.Fd()), int(unix.SIGTERM), 0)
+	if err != nil {
+		return
+	}
+
+	// Wait for the process to exit.
+	fds := []unix.PollFd{{Fd: int32(pidFd.Fd()), Events: unix.POLLIN}}
+	_, _ = unix.Poll(fds, 5000)
+
+	_ = os.Remove(pidPath)
+}
+
 // onStopNS is triggered by LXC's stop hook once a container is shutdown but before the container's
 // namespaces have been closed. The netns path of the stopped container is provided.
 func (d *lxc) onStopNS(args map[string]string) error {
@@ -3387,6 +3615,9 @@ func (d *lxc) onStopNS(args map[string]string) error {
 	if err != nil {
 		return err
 	}
+
+	// Stop the DHCP client if any.
+	d.stopDHCPClient()
 
 	// Clean up devices.
 	d.cleanupDevices(false, netns)
@@ -3445,16 +3676,8 @@ func (d *lxc) onStop(args map[string]string) error {
 		// Clean up devices.
 		d.cleanupDevices(false, "")
 
-		// Stop DHCP client if any.
-		if util.PathExists(filepath.Join(d.Path(), "network", "dhcp.pid")) {
-			dhcpPIDStr, err := os.ReadFile(filepath.Join(d.Path(), "network", "dhcp.pid"))
-			if err == nil {
-				dhcpPID, err := strconv.Atoi(strings.TrimSpace(string(dhcpPIDStr)))
-				if err == nil {
-					_ = unix.Kill(dhcpPID, unix.SIGTERM)
-				}
-			}
-		}
+		// Stop the DHCP client if it's somehow still around.
+		d.stopDHCPClient()
 
 		// Remove directory ownership (to avoid issue if uidmap is reused)
 		err := os.Chown(d.Path(), 0, 0)
@@ -3609,6 +3832,21 @@ func (d *lxc) cleanupDevices(instanceRunning bool, stopHookNetnsPath string) {
 				d.logger.Error("Failed to stop device", logger.Ctx{"device": dev.Name(), "err": err})
 			}
 		}
+	}
+}
+
+// cleanupFailedMigrationRestore removes devices prepared by startCommon when CRIU restore fails before the stop hooks can run.
+func (d *lxc) cleanupFailedMigrationRestore() {
+	d.cleanupDevices(false, "")
+
+	err := d.removeUnixDevices()
+	if err != nil {
+		d.logger.Error("Failed to remove Unix devices after migration restore failure", logger.Ctx{"err": err})
+	}
+
+	err = d.removeDiskDevices()
+	if err != nil {
+		d.logger.Error("Failed to remove disk devices after migration restore failure", logger.Ctx{"err": err})
 	}
 }
 
@@ -3940,7 +4178,7 @@ func (d *lxc) snapshot(name string, expiry time.Time, stateful bool) error {
 			return err
 		}
 
-		defer func() { _ = os.RemoveAll(stateDir) }()
+		defer logger.WarnOnError(func() error { return os.RemoveAll(stateDir) }, "Failed to remove state directory")
 
 		// Release liblxc container once done.
 		defer func() {
@@ -4349,7 +4587,8 @@ func (d *lxc) delete(force bool, cleanupDependencies bool) error {
 						return fmt.Errorf("Failed loading storage pool: %w", err)
 					}
 
-					err = diskPool.DeleteCustomVolume(d.Project().Name, dev.Config["source"], nil)
+					volName, _ := internalInstance.SplitVolumeSource(dev.Config["source"])
+					err = diskPool.DeleteCustomVolume(d.Project().Name, volName, nil)
 					if err != nil {
 						return err
 					}
@@ -5018,7 +5257,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 							return err
 						}
 
-						defer func() { _ = files.Close() }()
+						defer logger.WarnOnError(files.Close, "Failed to close SFTP connection")
 
 						_, err = files.Lstat("/dev/incus")
 						if err == nil {
@@ -5105,7 +5344,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 
 				// Store the old values for revert
 				oldMemswLimit := int64(-1)
-				if cgroup.Supports(cgroup.Memory) {
+				if cgroup.Supports(cgroup.MemorySwap) {
 					oldMemswLimit, err = cg.GetMemorySwapLimit()
 					if err != nil {
 						oldMemswLimit = -1
@@ -5136,7 +5375,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 				}
 
 				// Reset everything
-				if cgroup.Supports(cgroup.Memory) {
+				if cgroup.Supports(cgroup.MemorySwap) {
 					err = cg.SetMemorySwapLimit(-1)
 					if err != nil {
 						revertMemory()
@@ -5171,26 +5410,27 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 						return err
 					}
 
-					if cgroup.Supports(cgroup.Memory) {
-						if util.IsTrueOrEmpty(memorySwap) || util.IsFalse(memorySwap) {
-							err = cg.SetMemorySwapLimit(0)
-							if err != nil {
+					if util.IsTrueOrEmpty(memorySwap) || util.IsFalse(memorySwap) {
+						err = cg.SetMemorySwapLimit(0)
+						if err != nil {
+							// Ignore missing swap accounting unless explicitly configured.
+							if memorySwap != "" || !errors.Is(err, cgroup.ErrControllerMissing) {
 								revertMemory()
 								return err
 							}
-						} else {
-							// Additional memory as swap.
-							swapInt, err := units.ParseByteSizeString(memorySwap)
-							if err != nil {
-								revertMemory()
-								return err
-							}
+						}
+					} else {
+						// Additional memory as swap.
+						swapInt, err := units.ParseByteSizeString(memorySwap)
+						if err != nil {
+							revertMemory()
+							return err
+						}
 
-							err = cg.SetMemorySwapLimit(swapInt)
-							if err != nil {
-								revertMemory()
-								return err
-							}
+						err = cg.SetMemorySwapLimit(swapInt)
+						if err != nil {
+							revertMemory()
+							return err
 						}
 					}
 				}
@@ -5214,8 +5454,11 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 
 						// Maximum priority (10) should be default swappiness (60).
 						err = cg.SetMemorySwappiness(int64(70 - priority))
-						if err != nil && !errors.Is(err, cgroup.ErrControllerMissing) {
-							return err
+						if err != nil {
+							// Ignore missing swappiness support unless explicitly configured.
+							if memorySwapPriority != "" || !errors.Is(err, cgroup.ErrControllerMissing) {
+								return err
+							}
 						}
 					}
 				}
@@ -5464,7 +5707,7 @@ func (d *lxc) Export(metaWriter io.Writer, rootfsWriter io.Writer, properties ma
 		return nil, err
 	}
 
-	defer func() { _ = d.unmount() }()
+	defer logger.WarnOnError(d.unmount, "Failed to unmount instance")
 
 	// Get IDMap to unshift container as the tarball is created.
 	diskIdmap, err := d.DiskIdmap()
@@ -5603,9 +5846,9 @@ func (d *lxc) Export(metaWriter io.Writer, rootfsWriter io.Writer, properties ma
 		return nil, err
 	}
 
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	defer logger.WarnOnError(func() error { return os.RemoveAll(tempDir) }, "Failed to remove temporary directory")
 
-	data, err := yaml.Dump(&meta, yaml.V2)
+	data, err := yaml.Dump(&meta, yaml.WithV2Defaults())
 	if err != nil {
 		_ = metaTarWriter.Close()
 		if rootfsTarWriter != nil {
@@ -5737,7 +5980,7 @@ func getCRIULogErrors(imagesDir string, method string) (string, error) {
 		return "", err
 	}
 
-	defer func() { _ = f.Close() }()
+	defer logger.WarnOnError(f.Close, "Failed to close file")
 
 	scanner := bufio.NewScanner(f)
 	ret := []string{}
@@ -6265,7 +6508,7 @@ func (d *lxc) MigrateSend(args instance.MigrateSendArgs) error {
 				}
 			} else {
 				d.logger.Debug("The version of liblxc is older than 2.0.4 and the live migration will probably fail")
-				defer func() { _ = os.RemoveAll(checkpointDir) }()
+				defer logger.WarnOnError(func() error { return os.RemoveAll(checkpointDir) }, "Failed to remove checkpoint directory")
 				criuMigrationArgs := instance.CriuMigrationArgs{
 					Cmd:          liblxc.MIGRATE_DUMP,
 					StateDir:     checkpointDir,
@@ -6902,7 +7145,7 @@ func (d *lxc) MigrateReceive(args instance.MigrateReceiveArgs) error {
 				return err
 			}
 
-			defer func() { _ = os.RemoveAll(imagesDir) }()
+			defer logger.WarnOnError(func() error { return os.RemoveAll(imagesDir) }, "Failed to remove images directory")
 
 			sync := &migration.MigrationSync{
 				FinalPreDump: proto.Bool(false),
@@ -6973,6 +7216,7 @@ func (d *lxc) MigrateReceive(args instance.MigrateReceiveArgs) error {
 			// here since we know that "final" is the folder for CRIU's final dump.
 			err = d.migrate(&criuMigrationArgs)
 			if err != nil {
+				d.cleanupFailedMigrationRestore()
 				return err
 			}
 
@@ -7140,7 +7384,7 @@ func (d *lxc) migrate(args *instance.CriuMigrationArgs) error {
 		_, migrateErr = subprocess.RunCommand(
 			d.state.OS.ExecPath,
 			"forkmigrate",
-			d.name,
+			project.Instance(d.Project().Name, d.Name()),
 			d.state.OS.LxcPath,
 			configPath,
 			finalStateDir,
@@ -7308,7 +7552,7 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 		return fmt.Errorf("Failed to open instance rootfs path: %w", err)
 	}
 
-	defer func() { _ = rootfs.Close() }()
+	defer logger.WarnOnError(rootfs.Close, "Failed to close rootfs")
 
 	// Go through the templates.
 	for tplPath, tpl := range metadata.Templates {
@@ -7450,7 +7694,7 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 					return err
 				}
 			}
-			defer func() { _ = w.Close() }()
+			defer logger.WarnOnError(w.Close, "Failed to close file")
 
 			// Read the template
 			tplString, err := os.ReadFile(filepath.Join(d.TemplatesPath(), tpl.Template))
@@ -7513,7 +7757,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	defer func() { _ = dirFile.Close() }()
+	defer logger.WarnOnError(dirFile.Close, "Failed to close directory")
 
 	forkfileAddr, err := net.ResolveUnixAddr("unix", fmt.Sprintf("/proc/self/fd/%d/forkfile.sock", dirFile.Fd()))
 	if err != nil {
@@ -7550,9 +7794,23 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 		return nil, err
 	}
 
+	// Record the socket file identity so cleanup doesn't remove a newer socket.
+	forkfileInfo, err := os.Stat(forkfilePath)
+	if err != nil {
+		_ = forkfileListener.Close()
+		return nil, err
+	}
+
+	removeForkfileSocket := func() {
+		info, err := os.Stat(forkfilePath)
+		if err == nil && os.SameFile(info, forkfileInfo) {
+			_ = os.Remove(forkfilePath)
+		}
+	}
+
 	reverter.Add(func() {
 		_ = forkfileListener.Close()
-		_ = os.Remove(forkfilePath)
+		removeForkfileSocket()
 	})
 
 	// Spawn forkfile in a Go routine.
@@ -7576,7 +7834,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 				return
 			}
 
-			defer func() { _ = d.unmount() }()
+			defer logger.WarnOnError(d.unmount, "Failed to unmount instance")
 		}
 
 		// Start building the command.
@@ -7595,7 +7853,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 			return
 		}
 
-		defer func() { _ = forkfileFile.Close() }()
+		defer logger.WarnOnError(forkfileFile.Close, "Failed to close forkfile listener")
 
 		args = append(args, "3")
 		extraFiles = append(extraFiles, forkfileFile)
@@ -7607,7 +7865,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 			return
 		}
 
-		defer func() { _ = rootfsFile.Close() }()
+		defer logger.WarnOnError(rootfsFile.Close, "Failed to close rootfs")
 
 		args = append(args, "4")
 		extraFiles = append(extraFiles, rootfsFile)
@@ -7620,7 +7878,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 				return
 			}
 
-			defer func() { _ = pidFd.Close() }()
+			defer logger.WarnOnError(pidFd.Close, "Failed to close PID fd")
 			args = append(args, "5")
 			extraFiles = append(extraFiles, pidFd)
 		} else {
@@ -7680,7 +7938,7 @@ func (d *lxc) FileSFTPConn() (net.Conn, error) {
 		// thinking a listener is available while other deferred calls are being processed.
 		defer func() {
 			_ = forkfileListener.Close()
-			_ = os.Remove(forkfilePath)
+			removeForkfileSocket()
 			_ = os.Remove(pidFile)
 		}()
 
@@ -7735,6 +7993,58 @@ func (d *lxc) FileSFTP() (*sftp.Client, error) {
 	}()
 
 	return client, nil
+}
+
+// PortForwardConn connects to the given address and TCP port from within the instance's network namespace.
+func (d *lxc) PortForwardConn(address string, port int) (net.Conn, error) {
+	if !d.IsRunning() {
+		return nil, errors.New("Instance is not running")
+	}
+
+	// Create a socket pair to pass the connection around.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	parentFile := os.NewFile(uintptr(fds[0]), "forknet-parent")
+	defer func() { _ = parentFile.Close() }()
+
+	childFile := os.NewFile(uintptr(fds[1]), "forknet-child")
+	defer func() { _ = childFile.Close() }()
+
+	// Spawn forknet to establish the connection from within the network namespace.
+	var stderr bytes.Buffer
+
+	forknet := exec.Cmd{
+		Path:       d.state.OS.ExecPath,
+		Args:       []string{d.state.OS.ExecPath, "forknet", "connect", "--", fmt.Sprintf("/proc/%d/ns/net", d.InitPID()), address, strconv.Itoa(port)},
+		ExtraFiles: []*os.File{childFile},
+		Stderr:     &stderr,
+	}
+
+	err = forknet.Run()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to run forknet connect: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	// Close our copy of the child end so the receive below can't block forever.
+	_ = childFile.Close()
+
+	// Retrieve the connection from forknet.
+	file, err := netutils.AbstractUnixReceiveFd(int(parentFile.Fd()), netutils.UnixFdsAcceptExact)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting the connection: %w", err)
+	}
+
+	defer func() { _ = file.Close() }()
+
+	conn, err := net.FileConn(file)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
 }
 
 // stopForkFile attempts to send SIGTERM (if force is true) or SIGINT to forkfile then waits for it to exit.
@@ -7891,7 +8201,7 @@ func (d *lxc) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, st
 		return nil, err
 	}
 
-	defer func() { _ = logFile.Close() }()
+	defer logger.WarnOnError(logFile.Close, "Failed to close log file")
 
 	// Prepare the subcommand
 	cname := project.Instance(d.Project().Name, d.Name())
@@ -7943,7 +8253,7 @@ func (d *lxc) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, st
 
 	// Setup communication PIPE
 	rStatus, wStatus, err := os.Pipe()
-	defer func() { _ = rStatus.Close() }()
+	defer logger.WarnOnError(rStatus.Close, "Failed to close pipe")
 	if err != nil {
 		return nil, err
 	}
@@ -8303,7 +8613,7 @@ func (d *lxc) insertMountGo(source, target, fstype string, flags int, mntnsPID i
 		_ = f.Close()
 	}
 
-	defer func() { _ = os.Remove(tmpMount) }()
+	defer logger.WarnOnError(func() error { return os.Remove(tmpMount) }, "Failed to remove temporary mount")
 
 	// Mount the filesystem
 	err = unix.Mount(source, tmpMount, fstype, uintptr(flags), "")
@@ -8311,7 +8621,7 @@ func (d *lxc) insertMountGo(source, target, fstype string, flags int, mntnsPID i
 		return fmt.Errorf("Failed to setup temporary mount: %s", err)
 	}
 
-	defer func() { _ = unix.Unmount(tmpMount, unix.MNT_DETACH) }()
+	defer logger.WarnOnError(func() error { return unix.Unmount(tmpMount, unix.MNT_DETACH) }, "Failed to unmount temporary mount")
 
 	// Ensure that only flags modifying mount _properties_ make it through.
 	// Strip things such as MS_BIND which would cause the creation of a
@@ -8338,7 +8648,7 @@ func (d *lxc) insertMountGo(source, target, fstype string, flags int, mntnsPID i
 		return err
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close PID fd")
 
 	if !strings.HasPrefix(target, "/") {
 		target = "/" + target
@@ -8356,7 +8666,8 @@ func (d *lxc) insertMountGo(source, target, fstype string, flags int, mntnsPID i
 		mntsrc,
 		target,
 		string(idmapType),
-		fmt.Sprintf("%d", shiftfsFlags))
+		fmt.Sprintf("%d", shiftfsFlags),
+	)
 	if err != nil {
 		return err
 	}
@@ -8386,7 +8697,8 @@ func (d *lxc) insertMountLXC(source, target, fstype string, flags int) error {
 		source,
 		target,
 		fstype,
-		fmt.Sprintf("%d", flags))
+		fmt.Sprintf("%d", flags),
+	)
 	if err != nil {
 		return err
 	}
@@ -8414,7 +8726,7 @@ func (d *lxc) moveMount(source, target, fstype string, flags int, idmapType idma
 		return err
 	}
 
-	defer func() { _ = pidFd.Close() }()
+	defer logger.WarnOnError(pidFd.Close, "Failed to close PID fd")
 
 	pidStr := fmt.Sprintf("%d", pid)
 
@@ -8435,7 +8747,8 @@ func (d *lxc) moveMount(source, target, fstype string, flags int, idmapType idma
 		source,
 		target,
 		string(idmapType),
-		fmt.Sprintf("%d", flags))
+		fmt.Sprintf("%d", flags),
+	)
 	if err != nil {
 		return err
 	}
@@ -8477,7 +8790,8 @@ func (d *lxc) removeMount(mount string) error {
 		cname,
 		d.state.OS.LxcPath,
 		configPath,
-		mount)
+		mount,
+	)
 	if err != nil {
 		return err
 	}
@@ -8538,7 +8852,7 @@ func (d *lxc) InsertSeccompUnixDevice(prefix string, m deviceConfig.Device, pid 
 	tgtPath := dev.RelativePath
 
 	// Bind-mount it into the container
-	defer func() { _ = os.Remove(devPath) }()
+	defer logger.WarnOnError(func() error { return os.Remove(devPath) }, "Failed to remove device path")
 	return d.insertMountGo(devPath, tgtPath, "none", unix.MS_BIND, pid, idmap.StorageTypeNone)
 }
 
@@ -8611,7 +8925,7 @@ func (d *lxc) FillNetworkDevice(name string, m deviceConfig.Device) (deviceConfi
 		cname := project.Instance(d.Project().Name, d.Name())
 		cc, err := liblxc.NewContainer(cname, d.state.OS.LxcPath)
 		if err == nil {
-			defer func() { _ = cc.Release() }()
+			defer logger.WarnOnError(cc.Release, "Failed to release container")
 
 			interfaces, err := cc.Interfaces()
 			if err == nil {
@@ -9072,7 +9386,7 @@ func (d *lxc) Metrics(hostInterfaces []net.Interface) (*metrics.MetricSet, error
 	out.AddSamples(metrics.MemoryOOMKillsTotal, metrics.Sample{Value: float64(oomKills)})
 
 	// Handle swap.
-	if cgroup.Supports(cgroup.Memory) {
+	if cgroup.Supports(cgroup.MemorySwap) {
 		swapUsage, err := cg.GetMemorySwapUsage()
 		if err != nil {
 			d.logger.Warn("Failed to get swap usage", logger.Ctx{"err": err})
@@ -9434,7 +9748,7 @@ func (d *lxc) setupCredentials(update bool) error {
 		return fmt.Errorf("Failed to open the credentials directory: %w", err)
 	}
 
-	defer func() { _ = credsRoot.Close() }()
+	defer logger.WarnOnError(credsRoot.Close, "Failed to close credentials directory")
 
 	for k, v := range credentials {
 		err := credsRoot.WriteFile(k, v, 0o400)
@@ -9461,8 +9775,8 @@ func (d *lxc) setupCredentials(update bool) error {
 }
 
 // GuestOS returns the guest OS. For containers, we can safely assume Linux.
-func (d *lxc) GuestOS() string {
-	return "linux"
+func (d *lxc) GuestOS() osinfo.OSType {
+	return osinfo.Linux
 }
 
 // CreateQcow2Snapshot creates a qcow2 snapshot for a running instance. Not supported by containers.
@@ -9482,6 +9796,11 @@ func (d *lxc) ExportQcow2Block(diskName string, diskIndex int) (func(), string, 
 
 // ConnectNBD exports a disk over NBD. Not supported by containers.
 func (d *lxc) ConnectNBD(diskName string, volSize int64, writable bool) (net.Conn, func(), error) {
+	return nil, nil, instance.ErrNotImplemented
+}
+
+// ConnectNBDAllDisks exports all disks over NBD. Not supported by containers.
+func (d *lxc) ConnectNBDAllDisks(reuse bool) (net.Conn, func(), error) {
 	return nil, nil, instance.ErrNotImplemented
 }
 

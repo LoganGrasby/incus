@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/kballard/go-shellquote"
 	"go.yaml.in/yaml/v4"
 
@@ -77,25 +76,27 @@ var imageCmd = APIEndpoint{
 	Get:    APIEndpointAction{Handler: imageGet, AllowUntrusted: true},
 	Patch:  APIEndpointAction{Handler: imagePatch, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
 	Put:    APIEndpointAction{Handler: imagePut, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
-}
 
-var imageExportCmd = APIEndpoint{
-	Path: "images/{fingerprint}/export",
-
-	Get:  APIEndpointAction{Handler: imageExport, AllowUntrusted: true},
-	Post: APIEndpointAction{Handler: imageExportPost, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
-}
-
-var imageSecretCmd = APIEndpoint{
-	Path: "images/{fingerprint}/secret",
-
-	Post: APIEndpointAction{Handler: imageSecret, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
-}
-
-var imageRefreshCmd = APIEndpoint{
-	Path: "images/{fingerprint}/refresh",
-
-	Post: APIEndpointAction{Handler: imageRefresh, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
+	// The export/secret/refresh sub-paths are handled as suffix actions rather
+	// than dedicated routes. Under http.ServeMux a route such as
+	// "images/{fingerprint}/export" would conflict with the multi-segment
+	// "images/aliases/{name...}" route, so the image endpoint is registered as
+	// a subtree and the suffix is matched at dispatch time.
+	SuffixActions: []APIEndpointSuffixAction{
+		{
+			Name: "/export",
+			Get:  APIEndpointAction{Handler: imageExport, AllowUntrusted: true},
+			Post: APIEndpointAction{Handler: imageExportPost, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
+		},
+		{
+			Name: "/secret",
+			Post: APIEndpointAction{Handler: imageSecret, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
+		},
+		{
+			Name: "/refresh",
+			Post: APIEndpointAction{Handler: imageRefresh, AccessHandler: allowPermission(auth.ObjectTypeImage, auth.EntitlementCanEdit, "fingerprint")},
+		},
+	},
 }
 
 var imageAliasesCmd = APIEndpoint{
@@ -106,7 +107,7 @@ var imageAliasesCmd = APIEndpoint{
 }
 
 var imageAliasCmd = APIEndpoint{
-	Path: "images/aliases/{name:.*}",
+	Path: "images/aliases/{name...}",
 
 	Delete: APIEndpointAction{Handler: imageAliasDelete, AccessHandler: allowPermission(auth.ObjectTypeImageAlias, auth.EntitlementCanEdit, "name")},
 	Get:    APIEndpointAction{Handler: imageAliasGet, AllowUntrusted: true},
@@ -132,7 +133,12 @@ var imagePublishLock sync.Mutex
 var imageTaskMu sync.Mutex
 
 func compressFile(compress string, infile io.Reader, outfile io.Writer) error {
-	reproducible := []string{"gzip"}
+	// Compressors with reproducible output and the flags needed for it.
+	reproducible := map[string][]string{
+		"gzip": {"-n"},
+		"pigz": {"-n", "-m"},
+	}
+
 	var cmd *exec.Cmd
 
 	// Parse the command.
@@ -149,8 +155,8 @@ func compressFile(compress string, infile io.Reader, outfile io.Writer) error {
 			return err
 		}
 
-		defer func() { _ = tempfile.Close() }()
-		defer func() { _ = os.Remove(tempfile.Name()) }()
+		defer logger.WarnOnError(tempfile.Close, "Failed to close temporary file")
+		defer logger.WarnOnError(func() error { return os.Remove(tempfile.Name()) }, "Failed to remove temporary file")
 
 		// Prepare 'tar2sqfs' arguments
 		args := []string{"tar2sqfs"}
@@ -182,8 +188,18 @@ func compressFile(compress string, infile io.Reader, outfile io.Writer) error {
 			args = append(args, fields[1:]...)
 		}
 
-		if slices.Contains(reproducible, fields[0]) {
-			args = append(args, "-n")
+		// Prefer pigz over gzip when available.
+		if fields[0] == "gzip" {
+			_, err := exec.LookPath("pigz")
+			if err == nil {
+				fields[0] = "pigz"
+				args = append(args, "-p", strconv.Itoa(archive.CompressionThreads()))
+			}
+		}
+
+		flags, ok := reproducible[fields[0]]
+		if ok {
+			args = append(args, flags...)
 		}
 
 		cmd := exec.Command(fields[0], args...)
@@ -259,8 +275,8 @@ func imgPostInstanceInfo(ctx context.Context, s *state.State, r *http.Request, r
 		return nil, err
 	}
 
-	defer func() { _ = os.Remove(metaFile.Name()) }()
-	defer func() { _ = os.Remove(rootfsFile.Name()) }()
+	defer logger.WarnOnError(func() error { return os.Remove(metaFile.Name()) }, "Failed to remove metadata file")
+	defer logger.WarnOnError(func() error { return os.Remove(rootfsFile.Name()) }, "Failed to remove rootfs file")
 
 	// Calculate (close estimate of) total size of input to image
 	totalSize := int64(0)
@@ -738,7 +754,7 @@ func getImgPostInfo(ctx context.Context, s *state.State, r *http.Request, buildd
 			return nil, err
 		}
 
-		defer func() { _ = os.Remove(imageTarf.Name()) }()
+		defer logger.WarnOnError(func() error { return os.Remove(imageTarf.Name()) }, "Failed to remove image tarball")
 
 		// Parse the POST data
 		_, err = post.Seek(0, io.SeekStart)
@@ -789,7 +805,7 @@ func getImgPostInfo(ctx context.Context, s *state.State, r *http.Request, buildd
 			return nil, err
 		}
 
-		defer func() { _ = os.Remove(rootfsTarf.Name()) }()
+		defer logger.WarnOnError(func() error { return os.Remove(rootfsTarf.Name()) }, "Failed to remove rootfs tarball")
 
 		size, err = util.SafeCopy(io.MultiWriter(rootfsTarf, hash256), part)
 		info.Size += size
@@ -1062,12 +1078,16 @@ func imageCreateInPool(s *state.State, info *api.Image, storagePool string) erro
 //      schema:
 //        $ref: "#/definitions/ImagesPost"
 //  responses:
-//    "200":
-//      $ref: "#/responses/EmptySyncResponse"
+//    "202":
+//      $ref: "#/responses/Operation"
 //    "400":
 //      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -1147,6 +1167,10 @@ func imageCreateInPool(s *state.State, info *api.Image, storagePool string) erro
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imagesPost(d *Daemon, r *http.Request) response.Response {
@@ -1439,7 +1463,7 @@ func getImageMetadata(fname string) (*api.ImageMetadata, string, error) {
 		return nil, "unknown", err
 	}
 
-	defer func() { _ = r.Close() }()
+	defer logger.WarnOnError(r.Close, "Failed to close file")
 
 	// Decompress if needed
 	_, algo, unpacker, err := archive.DetectCompressionFile(r)
@@ -1471,17 +1495,17 @@ func getImageMetadata(fname string) (*api.ImageMetadata, string, error) {
 			return nil, "unknown", err
 		}
 
-		defer func() { _ = stdout.Close() }()
+		defer logger.WarnOnError(stdout.Close, "Failed to close stdout pipe")
 
 		err = cmd.Start()
 		if err != nil {
 			return nil, "unknown", err
 		}
 
-		defer func() { _ = cmd.Wait() }()
+		defer logger.WarnOnError(cmd.Wait, "Failed to wait for command")
 
 		// Double close stdout, this is to avoid blocks in Wait()
-		defer func() { _ = stdout.Close() }()
+		defer logger.WarnOnError(stdout.Close, "Failed to close stdout pipe")
 
 		tr = tar.NewReader(stdout)
 	} else {
@@ -1673,8 +1697,14 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 //                "/1.0/images/06b86454720d36b20f94e31c6812e05ec51c1b568cf3a8abd273769d213394bb",
 //                "/1.0/images/084dd79dd1360fd25a2479eb46674c2a5ef3022a40fe03c91ab3603e3402b8e1"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -1726,8 +1756,14 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 //            description: List of images
 //            items:
 //              $ref: "#/definitions/Image"
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -1784,8 +1820,14 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 //                "/1.0/images/06b86454720d36b20f94e31c6812e05ec51c1b568cf3a8abd273769d213394bb",
 //                "/1.0/images/084dd79dd1360fd25a2479eb46674c2a5ef3022a40fe03c91ab3603e3402b8e1"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -1838,8 +1880,14 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 //	          description: List of images
 //	          items:
 //	            $ref: "#/definitions/Image"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imagesGet(d *Daemon, r *http.Request) response.Response {
@@ -2139,7 +2187,7 @@ func distributeImage(ctx context.Context, s *state.State, nodes []string, oldFin
 				return err
 			}
 
-			defer func() { _ = metaFile.Close() }()
+			defer logger.WarnOnError(metaFile.Close, "Failed to close metadata file")
 
 			createArgs.MetaFile = metaFile
 			createArgs.MetaName = filepath.Base(imageMetaPath)
@@ -2151,7 +2199,7 @@ func distributeImage(ctx context.Context, s *state.State, nodes []string, oldFin
 					return err
 				}
 
-				defer func() { _ = rootfsFile.Close() }()
+				defer logger.WarnOnError(rootfsFile.Close, "Failed to close rootfs file")
 
 				createArgs.RootfsFile = rootfsFile
 				createArgs.RootfsName = filepath.Base(imageRootfsPath)
@@ -2783,6 +2831,10 @@ func pruneExpiredImages(ctx context.Context, s *state.State, op *operations.Oper
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageDelete(d *Daemon, r *http.Request) response.Response {
@@ -2790,7 +2842,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 
 	projectName := request.ProjectParam(r)
 
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3034,7 +3086,7 @@ func imageValidSecret(s *state.State, r *http.Request, projectName string, finge
 			continue
 		}
 
-		if opSecret == secret {
+		if util.CompareSecret(opSecret, secret) {
 			// Check if the operation is currently running (we allow access while expired).
 			if op.Status == api.Running.String() {
 				// Token is single-use, so cancel it now.
@@ -3097,8 +3149,14 @@ func imageValidSecret(s *state.State, r *http.Request, projectName string, finge
 //            example: 200
 //          metadata:
 //            $ref: "#/definitions/Image"
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -3143,15 +3201,21 @@ func imageValidSecret(s *state.State, r *http.Request, projectName string, finge
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/Image"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageGet(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3235,6 +3299,10 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -3244,7 +3312,7 @@ func imagePut(d *Daemon, r *http.Request) response.Response {
 
 	// Get current value
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3349,6 +3417,10 @@ func imagePut(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -3358,7 +3430,7 @@ func imagePatch(d *Daemon, r *http.Request) response.Response {
 
 	// Get current value
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3464,12 +3536,16 @@ func imagePatch(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/ImageAliasesPost"
 //	responses:
-//	  "200":
+//	  "201":
 //	    $ref: "#/responses/EmptySyncResponse"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
@@ -3576,8 +3652,14 @@ func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
 //                "/1.0/images/aliases/foo",
 //                "/1.0/images/aliases/bar1"
 //              ]
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -3620,8 +3702,14 @@ func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
 //	          description: List of image aliases
 //	          items:
 //	            $ref: "#/definitions/ImageAliasesEntry"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
@@ -3720,8 +3808,14 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 //            example: 200
 //          metadata:
 //            $ref: "#/definitions/ImageAliasesEntry"
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -3766,13 +3860,19 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/ImageAliasesEntry"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasGet(d *Daemon, r *http.Request) response.Response {
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3829,13 +3929,17 @@ func imageAliasGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3904,6 +4008,10 @@ func imageAliasDelete(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -3913,7 +4021,7 @@ func imageAliasPut(d *Daemon, r *http.Request) response.Response {
 
 	// Get current value
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4000,6 +4108,10 @@ func imageAliasPut(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "412":
 //	    $ref: "#/responses/PreconditionFailed"
 //	  "500":
@@ -4009,7 +4121,7 @@ func imageAliasPatch(d *Daemon, r *http.Request) response.Response {
 
 	// Get current value
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4105,19 +4217,23 @@ func imageAliasPatch(d *Daemon, r *http.Request) response.Response {
 //	    schema:
 //	      $ref: "#/definitions/ImageAliasesEntryPost"
 //	responses:
-//	  "200":
+//	  "201":
 //	    $ref: "#/responses/EmptySyncResponse"
 //	  "400":
 //	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	name, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4199,8 +4315,14 @@ func imageAliasPost(d *Daemon, r *http.Request) response.Response {
 //  responses:
 //    "200":
 //      description: Raw image data
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
+//    "404":
+//      $ref: "#/responses/NotFound"
+//    "409":
+//      $ref: "#/responses/Conflict"
 //    "500":
 //      $ref: "#/responses/InternalServerError"
 
@@ -4229,15 +4351,21 @@ func imageAliasPost(d *Daemon, r *http.Request) response.Response {
 //	responses:
 //	  "200":
 //	    description: Raw image data
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageExport(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4400,15 +4528,21 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 //	responses:
 //	  "202":
 //	    $ref: "#/responses/Operation"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageExportPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4459,7 +4593,7 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		defer func() { _ = metaFile.Close() }()
+		defer logger.WarnOnError(metaFile.Close, "Failed to close metadata file")
 
 		createArgs.MetaFile = metaFile
 		createArgs.MetaName = filepath.Base(imageMetaPath)
@@ -4470,7 +4604,7 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 				return err
 			}
 
-			defer func() { _ = rootfsFile.Close() }()
+			defer logger.WarnOnError(rootfsFile.Close, "Failed to close rootfs file")
 
 			createArgs.RootfsFile = rootfsFile
 			createArgs.RootfsName = filepath.Base(imageRootfsPath)
@@ -4556,15 +4690,21 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 //	responses:
 //	  "202":
 //	    $ref: "#/responses/Operation"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageSecret(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -4590,21 +4730,21 @@ func imageImportFromNode(imagesDir string, client incus.InstanceServer, fingerpr
 		return fmt.Errorf("failed to create temporary directory for download: %w", err)
 	}
 
-	defer func() { _ = os.RemoveAll(buildDir) }()
+	defer logger.WarnOnError(func() error { return os.RemoveAll(buildDir) }, "Failed to remove build directory")
 
 	metaFile, err := os.CreateTemp(buildDir, "incus_tar_")
 	if err != nil {
 		return err
 	}
 
-	defer func() { _ = metaFile.Close() }()
+	defer logger.WarnOnError(metaFile.Close, "Failed to close metadata file")
 
 	rootfsFile, err := os.CreateTemp(buildDir, "incus_tar_")
 	if err != nil {
 		return err
 	}
 
-	defer func() { _ = rootfsFile.Close() }()
+	defer logger.WarnOnError(rootfsFile.Close, "Failed to close rootfs file")
 
 	getReq := incus.ImageFileRequest{
 		MetaFile:   io.ReadWriteSeeker(metaFile),
@@ -4680,15 +4820,21 @@ func imageImportFromNode(imagesDir string, client incus.InstanceServer, fingerpr
 //	responses:
 //	  "202":
 //	    $ref: "#/responses/Operation"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageRefresh(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	projectName := request.ProjectParam(r)
-	fingerprint, err := url.PathUnescape(mux.Vars(r)["fingerprint"])
+	fingerprint, err := pathVar(r, "fingerprint")
 	if err != nil {
 		return response.SmartError(err)
 	}

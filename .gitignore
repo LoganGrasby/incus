@@ -2,6 +2,7 @@
 po/*.mo
 po/*.po~
 incus-*.tar.xz
+installers
 .vagrant
 *~
 tags
@@ -12,7 +13,6 @@ incusd-bin
 cmd/fuidshift/fuidshift
 cmd/incus/incus
 cmd/lxc-to-incus/lxc-to-incus
-cmd/lxd-to-incus/lxd-to-incus
 cmd/incus-agent/incus-agent
 cmd/incus-benchmark/incus-benchmark
 cmd/incus-migrate/incus-migrate

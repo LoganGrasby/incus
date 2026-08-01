@@ -576,6 +576,150 @@ func (d *zfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData 
 	return postHook, cleanup, nil
 }
 
+func (d *zfs) receiveFromZfsSender(vol Volume, sender *exec.Cmd) error {
+	var receiver *exec.Cmd
+	if vol.ContentType() == ContentTypeBlock || d.isBlockBacked(vol) {
+		receiver = exec.Command("zfs", "receive", d.dataset(vol, false))
+	} else {
+		receiver = exec.Command("zfs", "receive", "-x", "mountpoint", d.dataset(vol, false))
+	}
+
+	// Configure the pipes.
+	receiver.Stdin, _ = sender.StdoutPipe()
+	receiver.Stdout = os.Stdout
+
+	var recvStderr bytes.Buffer
+	receiver.Stderr = &recvStderr
+
+	var sendStderr bytes.Buffer
+	sender.Stderr = &sendStderr
+
+	// Run the transfer.
+	err := receiver.Start()
+	if err != nil {
+		return fmt.Errorf("Failed starting ZFS receive: %w", err)
+	}
+
+	err = sender.Start()
+	if err != nil {
+		_ = receiver.Process.Kill()
+		return fmt.Errorf("Failed starting ZFS send: %w", err)
+	}
+
+	senderErr := make(chan error)
+	go func() {
+		err := sender.Wait()
+		if err != nil {
+			_ = receiver.Process.Kill()
+
+			// This removes any newlines in the error message.
+			msg := strings.ReplaceAll(strings.TrimSpace(sendStderr.String()), "\n", " ")
+
+			senderErr <- fmt.Errorf("Failed ZFS send: %w (%s)", err, msg)
+			return
+		}
+
+		senderErr <- nil
+	}()
+
+	err = receiver.Wait()
+	if err != nil {
+		_ = sender.Process.Kill()
+
+		// This removes any newlines in the error message.
+		msg := strings.ReplaceAll(strings.TrimSpace(recvStderr.String()), "\n", " ")
+
+		return fmt.Errorf("Failed ZFS receive: %w (%s)", err, msg)
+	}
+
+	err = <-senderErr
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *zfs) useSnapshotSendChain(srcVol Volume) (bool, error) {
+	srcDataset := d.dataset(srcVol, false)
+
+	if d.needsRecursion(srcDataset) {
+		return false, nil
+	}
+
+	encryptionRoot, err := d.getDatasetProperty(srcDataset, "encryptionroot")
+	if err != nil {
+		// Older ZFS versions may not support encryption properties. Keep the existing
+		// replication stream path in that case.
+		return false, nil
+	}
+
+	if encryptionRoot == "" || encryptionRoot == "-" {
+		return false, nil
+	}
+
+	origin, err := d.getDatasetProperty(srcDataset, "origin")
+	if err != nil {
+		return false, err
+	}
+
+	return origin == "" || origin == "-", nil
+}
+
+func (d *zfs) copyVolumeSnapshotsUsingSend(vol Volume, srcVol Volume, srcSnapshot string, snapshots []string) error {
+	srcDataset := d.dataset(srcVol, false)
+	requested := map[string]struct{}{}
+	for _, snapshot := range snapshots {
+		requested[snapshot] = struct{}{}
+	}
+
+	entries, err := d.getDatasets(srcDataset, "snapshot")
+	if err != nil {
+		return err
+	}
+
+	sourceSnapshots := make([]string, 0, len(snapshots)+1)
+	for _, entry := range entries {
+		snapName, ok := strings.CutPrefix(entry, "@snapshot-")
+		if !ok {
+			continue
+		}
+
+		_, ok = requested[snapName]
+		if !ok {
+			continue
+		}
+
+		sourceSnapshots = append(sourceSnapshots, fmt.Sprintf("%s%s", srcDataset, entry))
+	}
+
+	if len(sourceSnapshots) != len(snapshots) {
+		return fmt.Errorf("Failed locating all ZFS snapshots for copy")
+	}
+
+	sourceSnapshots = append(sourceSnapshots, srcSnapshot)
+
+	var parentSnapshot string
+	for _, sourceSnapshot := range sourceSnapshots {
+		args := []string{"send"}
+		if parentSnapshot != "" {
+			args = append(args, "-i", parentSnapshot)
+		}
+
+		args = append(args, sourceSnapshot)
+
+		sender := exec.Command("zfs", args...)
+		err := d.receiveFromZfsSender(vol, sender)
+		if err != nil {
+			return err
+		}
+
+		parentSnapshot = sourceSnapshot
+	}
+
+	return nil
+}
+
 // CreateVolumeFromCopy provides same-pool volume copying functionality.
 func (d *zfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
 	var err error
@@ -681,19 +825,23 @@ func (d *zfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool
 		snapName := strings.SplitN(srcSnapshot, "@", 2)[1]
 
 		// Send/receive the snapshot.
-		var sender *exec.Cmd
-		var receiver *exec.Cmd
-		if vol.ContentType() == ContentTypeBlock || d.isBlockBacked(vol) {
-			receiver = exec.Command("zfs", "receive", d.dataset(vol, false))
-		} else {
-			receiver = exec.Command("zfs", "receive", "-x", "mountpoint", d.dataset(vol, false))
-		}
-
-		// Handle transferring snapshots.
 		if len(snapshots) > 0 {
-			// Raw send is required to send/receive encrypted volumes (and enables compression).
-			args := []string{"send", "-R", "-w", srcSnapshot}
-			sender = exec.Command("zfs", args...)
+			useSnapshotChain, err := d.useSnapshotSendChain(srcVol)
+			if err != nil {
+				return err
+			}
+
+			if useSnapshotChain {
+				err = d.copyVolumeSnapshotsUsingSend(vol, srcVol, srcSnapshot, snapshots)
+			} else {
+				// Raw send is required to send/receive encrypted volumes (and enables compression).
+				sender := exec.Command("zfs", "send", "-R", "-w", srcSnapshot)
+				err = d.receiveFromZfsSender(vol, sender)
+			}
+
+			if err != nil {
+				return err
+			}
 		} else {
 			args := []string{"send"}
 
@@ -702,6 +850,7 @@ func (d *zfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool
 				args = append(args, "-R", "-w")
 			}
 
+			var sender *exec.Cmd
 			if d.config["zfs.clone_copy"] == "rebase" {
 				var err error
 				origin := d.dataset(srcVol, false)
@@ -736,59 +885,11 @@ func (d *zfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool
 				args = append(args, srcSnapshot)
 				sender = exec.Command("zfs", args...)
 			}
-		}
 
-		// Configure the pipes.
-		receiver.Stdin, _ = sender.StdoutPipe()
-		receiver.Stdout = os.Stdout
-
-		var recvStderr bytes.Buffer
-		receiver.Stderr = &recvStderr
-
-		var sendStderr bytes.Buffer
-		sender.Stderr = &sendStderr
-
-		// Run the transfer.
-		err := receiver.Start()
-		if err != nil {
-			return fmt.Errorf("Failed starting ZFS receive: %w", err)
-		}
-
-		err = sender.Start()
-		if err != nil {
-			_ = receiver.Process.Kill()
-			return fmt.Errorf("Failed starting ZFS send: %w", err)
-		}
-
-		senderErr := make(chan error)
-		go func() {
-			err := sender.Wait()
+			err := d.receiveFromZfsSender(vol, sender)
 			if err != nil {
-				_ = receiver.Process.Kill()
-
-				// This removes any newlines in the error message.
-				msg := strings.ReplaceAll(strings.TrimSpace(sendStderr.String()), "\n", " ")
-
-				senderErr <- fmt.Errorf("Failed ZFS send: %w (%s)", err, msg)
-				return
+				return err
 			}
-
-			senderErr <- nil
-		}()
-
-		err = receiver.Wait()
-		if err != nil {
-			_ = sender.Process.Kill()
-
-			// This removes any newlines in the error message.
-			msg := strings.ReplaceAll(strings.TrimSpace(recvStderr.String()), "\n", " ")
-
-			return fmt.Errorf("Failed ZFS receive: %w (%s)", err, msg)
-		}
-
-		err = <-senderErr
-		if err != nil {
-			return err
 		}
 
 		// Delete the snapshot.
@@ -952,15 +1053,15 @@ func (d *zfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, vol
 		var syncSnapshots []*migration.Snapshot
 
 		// Get the GUIDs of all target snapshots.
-		for _, snapVol := range snapshots {
-			guid, err := d.getDatasetProperty(d.dataset(snapVol, false), "guid")
-			if err != nil {
-				return err
-			}
+		guids, err := d.getSnapshotGUIDs(d.dataset(vol, false))
+		if err != nil {
+			return err
+		}
 
+		for _, snapVol := range snapshots {
 			_, snapName, _ := api.GetParentAndSnapshotName(snapVol.name)
 
-			respSnapshots = append(respSnapshots, ZFSDataset{Name: snapName, GUID: guid})
+			respSnapshots = append(respSnapshots, ZFSDataset{Name: snapName, GUID: guids[d.dataset(snapVol, false)]})
 		}
 
 		if volumeOnly {
@@ -1033,22 +1134,17 @@ func (d *zfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, vol
 				}
 
 				respSnapshots = keptRespSnapshots
-			} else if len(migrationHeader.SnapshotDatasets) > 0 {
-				// No common base. Wipe target snapshots and request a full
-				// transfer of the source's snapshots.
-				for _, snapVol := range snapshots {
-					err = d.DeleteVolume(snapVol, op)
-					if err != nil {
-						return err
-					}
-				}
-
-				respSnapshots = []ZFSDataset{}
-
+			} else if len(snapshots) == 0 {
+				// The target has no snapshots so fallback to a full transfer.
 				syncSnapshots = nil
 				for _, dataset := range migrationHeader.SnapshotDatasets {
 					syncSnapshots = append(syncSnapshots, &migration.Snapshot{Name: &dataset.Name})
 				}
+			} else if len(migrationHeader.SnapshotDatasets) > 0 {
+				// The target has snapshots and no shared GUIDs,
+				// processing would cause the snapshots to be deleted and the migration to
+				// then fail.
+				return errors.New("Cannot refresh volume: source and target snapshots have no common base (GUID mismatch). Delete the target volume and copy again.")
 			}
 		}
 
@@ -1094,6 +1190,16 @@ func (d *zfs) createVolumeFromMigrationOptimized(vol Volume, conn io.ReadWriteCl
 
 	// Rollback to the latest identical snapshot if performing a refresh.
 	if volTargetArgs.Refresh {
+		// Temporarily remove the quota from the volume as the rollback and incremental
+		// receives below may otherwise be refused for lack of space. The quota is
+		// re-applied once the transfer has completed.
+		if vol.contentType == ContentTypeFS && !d.isBlockBacked(vol) {
+			err = d.setDatasetProperties(d.dataset(vol, false), "quota=none", "refquota=none")
+			if err != nil {
+				return err
+			}
+		}
+
 		snapshots, err = vol.Snapshots(op)
 		if err != nil {
 			return err
@@ -1304,6 +1410,30 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 		return d.CreateVolumeFromCopy(vol, srcVol, len(srcSnapshots) > 0, false, op)
 	}
 
+	// Temporarily remove the quota from the target volume as the rollbacks and incremental
+	// receives below may otherwise be refused for lack of space.
+	quotaCleared := vol.contentType == ContentTypeFS && !d.isBlockBacked(vol)
+	if quotaCleared {
+		err = d.setDatasetProperties(d.dataset(vol, false), "quota=none", "refquota=none")
+		if err != nil {
+			return err
+		}
+	}
+
+	// restoreQuota re-applies the quota using the source size as that's what the volume now holds.
+	restoreQuota := func() error {
+		if !quotaCleared {
+			return nil
+		}
+
+		quotaCleared = false
+
+		return d.SetVolumeQuota(vol, srcVol.ConfigSize(), false, op)
+	}
+
+	// Make sure the quota is restored on error too.
+	defer logger.WarnOnError(restoreQuota, "Failed to restore volume quota", logger.Ctx{"volume": vol.Name()})
+
 	transfer := func(src Volume, target Volume, origin Volume) error {
 		var sender *exec.Cmd
 
@@ -1413,7 +1543,13 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 			// refresh instead.
 			if errors.Is(err, ErrSnapshotDoesNotMatchIncrementalSource) {
 				d.logger.Debug("Unable to perform an optimized refresh, doing a generic refresh", logger.Ctx{"err": err})
-				return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+
+				err = genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+				if err != nil {
+					return err
+				}
+
+				return restoreQuota()
 			}
 
 			return fmt.Errorf("Failed to transfer snapshot %q: %w", snap.name, err)
@@ -1430,7 +1566,13 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 				// refresh instead.
 				if errors.Is(err, ErrSnapshotDoesNotMatchIncrementalSource) {
 					d.logger.Debug("Unable to perform an optimized refresh, doing a generic refresh", logger.Ctx{"err": err})
-					return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+
+					err = genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+					if err != nil {
+						return err
+					}
+
+					return restoreQuota()
 				}
 
 				return fmt.Errorf("Failed to transfer snapshot %q: %w", snap.name, err)
@@ -1459,7 +1601,13 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 		// refresh instead.
 		if errors.Is(err, ErrSnapshotDoesNotMatchIncrementalSource) {
 			d.logger.Debug("Unable to perform an optimized refresh, doing a generic refresh", logger.Ctx{"err": err})
-			return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+
+			err = genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+			if err != nil {
+				return err
+			}
+
+			return restoreQuota()
 		}
 
 		return fmt.Errorf("Failed to transfer main volume: %w", err)
@@ -1476,7 +1624,13 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 			// refresh instead.
 			if errors.Is(err, ErrSnapshotDoesNotMatchIncrementalSource) {
 				d.logger.Debug("Unable to perform an optimized refresh, doing a generic refresh", logger.Ctx{"err": err})
-				return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+
+				err = genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
+				if err != nil {
+					return err
+				}
+
+				return restoreQuota()
 			}
 
 			return fmt.Errorf("Failed to transfer main volume: %w", err)
@@ -1506,7 +1660,7 @@ func (d *zfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, al
 		return err
 	}
 
-	return nil
+	return restoreQuota()
 }
 
 // DeleteVolume deletes a volume of the storage device. If any snapshots of the volume remain then
@@ -2133,7 +2287,7 @@ func (d *zfs) getVolumeDiskPathFromDataset(dataset string) (string, error) {
 			return ""
 		}
 
-		defer func() { _ = r.Close() }()
+		defer logger.WarnOnError(r.Close, "Failed to close file")
 
 		// Perform the BLKZNAME ioctl.
 		buf := [256]byte{}
@@ -3016,8 +3170,8 @@ func (d *zfs) BackupVolume(vol Volume, writer instancewriter.InstanceWriter, bas
 			return fmt.Errorf("Failed to open temporary file for ZFS backup: %w", err)
 		}
 
-		defer func() { _ = tmpFile.Close() }()
-		defer func() { _ = os.Remove(tmpFile.Name()) }()
+		defer logger.WarnOnError(tmpFile.Close, "Failed to close temporary file")
+		defer logger.WarnOnError(func() error { return os.Remove(tmpFile.Name()) }, "Failed to remove temporary file")
 
 		// Write the subvolume to the file.
 		d.logger.Debug("Generating optimized volume file", logger.Ctx{"sourcePath": path, "file": tmpFile.Name(), "name": fileName})

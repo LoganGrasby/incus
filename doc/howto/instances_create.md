@@ -106,7 +106,7 @@ To launch a container with this instance type, enter the following command:
 
     incus launch images:debian/12 my-instance --type t2.micro
 
-The list of supported clouds and instance types can be found at [`https://github.com/dustinkirkland/instance-type`](https://github.com/dustinkirkland/instance-type).
+The list of supported clouds and instance types can be found at [`https://images.linuxcontainers.org/meta/instance-types/`](https://images.linuxcontainers.org/meta/instance-types/).
 
 ### Launch a VM that boots from an ISO
 
@@ -271,6 +271,7 @@ The supported features are:
 - `exec` controls whether commands can be executed through the agent
 - `files` controls whether the files transfer API is available
 - `mounts` controls whether to setup the file system mounts for shared disk devices
+- `port-forward` controls whether TCP connections can be forwarded to ports inside of the guest
 - `metrics` controls access to detailed OpenMetrics data
 - `state` controls access to basic OS state information (OS version, network interface details, ...)
 

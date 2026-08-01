@@ -37,14 +37,15 @@ Supported Conditions:
   ip               Wait for any globally routable IP address
   ipv4             Wait for a globally routable IPv4 address
   ipv6             Wait for a globally routable IPv6 address
-  status=STATUS    Wait for the instance status to become STATUS`))
+  status=STATUS    Wait for the instance status to become STATUS`,
+	))
 	cmd.Example = cli.FormatSection("", i18n.G(`incus wait v1 agent
 	Wait for VM instance v1 to have a functional agent.`))
 
 	cmd.RunE = c.run
 
-	cli.AddIntFlag(cmd.Flags(), &c.flagInterval, "interval", 5, i18n.G("Polling interval (in seconds)"))
-	cli.AddIntFlag(cmd.Flags(), &c.flagTimeOut, "timeout", -1, i18n.G("Maximum wait time"))
+	cli.AddIntFlag(cmd.Flags(), &c.flagInterval, "interval", i18n.G("Polling interval (in seconds)"), 5)
+	cli.AddIntFlag(cmd.Flags(), &c.flagTimeOut, "timeout", i18n.G("Maximum wait time"), -1)
 
 	cmd.ValidArgsFunction = func(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {

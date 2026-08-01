@@ -80,6 +80,7 @@ EB
 Ebit
 eBPF
 ECDHE
+EAB
 ECDSA
 ECMP
 EDK
@@ -109,12 +110,15 @@ GIDs
 Github
 Golang
 goroutines
+GPG
 GPUs
 Grafana
+GUID
 HAProxy
 hardcoded
 HDDs
 Hellman
+HMAC
 Homebrew
 hostname
 hotplug
@@ -178,6 +182,8 @@ MiB
 Mibit
 MicroCeph
 MicroCloud
+misconfigured
+MCS
 MII
 MITM
 MTU
@@ -193,6 +199,7 @@ NDP
 netmask
 NFS
 NIC
+NIC's
 NICs
 NixOS
 NUMA

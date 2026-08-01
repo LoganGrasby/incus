@@ -2,9 +2,6 @@ package main
 
 import (
 	"net/http"
-	"net/url"
-
-	"github.com/gorilla/mux"
 
 	"github.com/lxc/incus/v7/internal/server/auth"
 	"github.com/lxc/incus/v7/internal/server/response"
@@ -61,8 +58,14 @@ var storagePoolResourcesCmd = APIEndpoint{
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/Resources"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func api10ResourcesGet(d *Daemon, r *http.Request) response.Response {
@@ -124,8 +127,14 @@ func api10ResourcesGet(d *Daemon, r *http.Request) response.Response {
 //	          example: 200
 //	        metadata:
 //	          $ref: "#/definitions/ResourcesStoragePool"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
 //	  "403":
 //	    $ref: "#/responses/Forbidden"
+//	  "404":
+//	    $ref: "#/responses/NotFound"
+//	  "409":
+//	    $ref: "#/responses/Conflict"
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolResourcesGet(d *Daemon, r *http.Request) response.Response {
@@ -138,7 +147,7 @@ func storagePoolResourcesGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the existing storage pool
-	poolName, err := url.PathUnescape(mux.Vars(r)["name"])
+	poolName, err := pathVar(r, "name")
 	if err != nil {
 		return response.SmartError(err)
 	}

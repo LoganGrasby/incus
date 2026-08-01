@@ -819,6 +819,7 @@ var (
 	Bucket             = placeholder{i18n.G("bucket")}
 	Client             = placeholder{i18n.G("client")}
 	CommandLine        = list{placeholder{i18n.G("command-line argument")}, 1, " "}
+	Default            = placeholder{i18n.G("default")}
 	Device             = placeholder{i18n.G("device")}
 	Direction          = alternative{[]Atom{verbatim{"ingress"}, verbatim{"egress"}}}
 	Directory          = placeholder{i18n.G("directory")}
@@ -834,8 +835,9 @@ var (
 	Interface          = placeholder{i18n.G("interface")}
 	ListenAddress      = placeholder{i18n.G("listen address")}
 	ListenPort         = placeholder{i18n.G("listen port")}
+	KeepaliveTimeout   = placeholder{i18n.G("keepalive timeout")}
 	Key                = placeholder{i18n.G("key")}
-	KV                 = compound{"=", []Atom{Key, Value}}
+	KV                 = MakeKV(Key, Value)
 	Member             = placeholder{i18n.G("member")}
 	Network            = placeholder{i18n.G("network")}
 	NetworkIntegration = placeholder{i18n.G("network integration")}
@@ -863,6 +865,7 @@ var (
 	Type               = placeholder{i18n.G("type")}
 	URL                = placeholder{i18n.G("URL")}
 	Value              = placeholder{i18n.G("value")}
+	Variable           = placeholder{i18n.G("variable")}
 	Volume             = placeholder{i18n.G("volume")}
 	WarningUUID        = placeholder{i18n.G("warning UUID")}
 	Zone               = placeholder{i18n.G("zone")}
@@ -913,6 +916,11 @@ func Colon(a Atom) Atom {
 // MakePath builds an atom compound separated by `/`.
 func MakePath(atoms ...Atom) Atom {
 	return compound{"/", atoms}
+}
+
+// MakeKV builds an atom 2-compound separated by `=`.
+func MakeKV(k Atom, v Atom) Atom {
+	return compound{"=", []Atom{k, v}}
 }
 
 // Placeholder builds a placeholder atom from a string.
